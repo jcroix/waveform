@@ -69,7 +69,9 @@ private struct DetailPlaceholder: View {
                     document: document,
                     visibleSignalIDs: state.visibleSignalIDs,
                     viewport: state.viewportX,
-                    onViewportChange: { state.viewportX = $0 }
+                    focusedSignalID: state.focusedSignalID,
+                    onViewportChange: { state.viewportX = $0 },
+                    onFocusChange: { state.focusedSignalID = $0 }
                 )
                 // Rebuild the plot from scratch when the source file changes so
                 // the viewport and decimation cache fully reset.
@@ -83,12 +85,14 @@ private struct DetailPlaceholder: View {
         HStack(spacing: 14) {
             ForEach(state.visibleSignalIDs, id: \.self) { signalID in
                 if let signal = document.signal(withID: signalID) {
+                    let isFocused = state.focusedSignalID == signalID
                     HStack(spacing: 6) {
                         Circle()
                             .fill(Color(nsColor: ColorPalette.stableColor(for: signalID)))
-                            .frame(width: 10, height: 10)
+                            .frame(width: isFocused ? 12 : 10, height: isFocused ? 12 : 10)
                         Text(signal.displayName)
                             .font(.caption)
+                            .fontWeight(isFocused ? .semibold : .regular)
                         Text("(\(signal.unit))")
                             .font(.caption)
                             .foregroundStyle(.secondary)

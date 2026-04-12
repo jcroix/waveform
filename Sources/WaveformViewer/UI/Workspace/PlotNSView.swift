@@ -40,6 +40,21 @@ final class PlotNSView: NSView {
     /// the new span against a stable baseline.
     private var pinchStartViewport: ClosedRange<Double>?
 
+    // MARK: - Focus (Phase 9.1)
+
+    /// ID of the currently-focused signal, or `nil` if no trace is focused. Focused
+    /// traces render at a heavier line width. Supplied by the owner via `setContent`;
+    /// mouseDown hit-testing proposes focus changes back through `onFocusChange`.
+    private var focusedSignalID: SignalID?
+
+    /// Callback fired when the user clicks on (or near) a trace, or clicks into empty
+    /// plot area with no trace nearby. Bound to `state.focusedSignalID = newValue`.
+    var onFocusChange: ((SignalID?) -> Void)?
+
+    /// Maximum pixel distance from a click point to a trace's bucket envelope for a
+    /// click to count as a hit on that trace. Anything beyond this deselects.
+    private let hitTestRadius: CGFloat = 8
+
     // MARK: - Layers
 
     private let traceContainer = CALayer()
@@ -64,6 +79,7 @@ final class PlotNSView: NSView {
         let boundsSize: CGSize
         let viewportLowerBits: UInt64
         let viewportUpperBits: UInt64
+        let focusedSignalID: SignalID?
     }
     private var lastRebuildKey: RebuildKey?
 
@@ -139,6 +155,104 @@ final class PlotNSView: NSView {
         // Claim first responder on click so ⌘0 and other key events route here.
         window?.makeFirstResponder(self)
         super.mouseDown(with: event)
+
+        // Only single-click events run hit testing. Double-clicks route through the
+        // NSClickGestureRecognizer installed in `installGestureRecognizers()` and
+        // reset the viewport; selection state for the first click of a double-click
+        // is fine to land either way.
+        guard event.clickCount == 1 else { return }
+
+        let clickWindow = event.locationInWindow
+        let clickLocal = convert(clickWindow, from: nil)
+        // Sample a small neighborhood of columns around the click to tolerate bucket
+        // edges and sub-pixel click positions. See `hitTestTrace(at:)`.
+        let hit = hitTestTrace(at: clickLocal)
+        onFocusChange?(hit)
+    }
+
+    /// Returns the `SignalID` of the trace closest to `point`, or `nil` if no trace is
+    /// within `hitTestRadius`. Scans the click's pixel column **and a few adjacent
+    /// columns** so a click that lands on a bucket boundary (or a sparse bucket whose
+    /// neighbor carries the actual sample) still hits. Distances are Euclidean in
+    /// pixel space, which matters when a nearby bucket's X offset is a few pixels away
+    /// from the click. On ties, the trace drawn later in the z-order wins.
+    private func hitTestTrace(at point: CGPoint) -> SignalID? {
+        let plotArea = computePlotArea()
+        guard plotArea.contains(point) else { return nil }
+
+        guard let document = document,
+              let geometry = computeGeometry() else {
+            return nil
+        }
+
+        let signals = visibleSignalIDs.compactMap { document.signal(withID: $0) }
+        guard !signals.isEmpty else { return nil }
+
+        let plotWidth = Double(plotArea.width)
+        let plotHeight = Double(plotArea.height)
+        guard plotWidth > 1, plotHeight > 1 else { return nil }
+
+        let pixelWidth = max(1, Int(plotArea.width.rounded(.up)))
+        let viewport = geometry.tMin...geometry.tMax
+        let ySpan = geometry.yMax - geometry.yMin
+        guard ySpan > 0 else { return nil }
+
+        // Click position in plot-local coordinates. Truncate the x offset to get the
+        // column that visually contains the click (matches the `Int(normalized * W)`
+        // column mapping used by `Decimator.decimate`).
+        let clickXOffset = Double(point.x - plotArea.minX)
+        let clickY = Double(point.y - plotArea.minY)
+        let centerColumn = Int(clickXOffset)
+        let radius = Double(hitTestRadius)
+        // Scan the click column plus `hitTestRadius` columns on either side. That way
+        // a click that lands in a bucket with no samples (sparse trace) or between two
+        // bucket centers still finds the trace the user intended.
+        let scanRadius = Int(ceil(radius))
+        let lowColumn = max(0, centerColumn - scanRadius)
+        let highColumn = min(pixelWidth - 1, centerColumn + scanRadius)
+
+        var best: (signalID: SignalID, traceIndex: Int, distance: Double)?
+
+        for (traceIndex, signal) in signals.enumerated() {
+            let decimated = decimationCache.decimatedTrace(
+                for: signal,
+                timeValues: document.timeValues,
+                viewport: viewport,
+                pixelWidth: pixelWidth
+            )
+            guard decimated.buckets.count == pixelWidth else { continue }
+
+            for column in lowColumn...highColumn {
+                let bucket = decimated.buckets[column]
+                guard bucket.isPopulated else { continue }
+
+                let bucketX = Double(column)
+                let yLow = (Double(bucket.minValue) - geometry.yMin) / ySpan * plotHeight
+                let yHigh = (Double(bucket.maxValue) - geometry.yMin) / ySpan * plotHeight
+
+                // Closest point on the vertical segment [bucketX, yLow..yHigh] to the
+                // click (bucketX is the segment's x; y is clamped to [yLow, yHigh]).
+                let clampedY = max(yLow, min(yHigh, clickY))
+                let dx = clickXOffset - bucketX
+                let dy = clickY - clampedY
+                let distance = (dx * dx + dy * dy).squareRoot()
+
+                guard distance <= radius else { continue }
+
+                if let current = best {
+                    // Prefer closer traces. On ties, prefer the one later in the
+                    // z-order (visually on top).
+                    if distance < current.distance ||
+                       (distance == current.distance && traceIndex > current.traceIndex) {
+                        best = (signal.id, traceIndex, distance)
+                    }
+                } else {
+                    best = (signal.id, traceIndex, distance)
+                }
+            }
+        }
+
+        return best?.signalID
     }
 
     override func keyDown(with event: NSEvent) {
@@ -196,12 +310,14 @@ final class PlotNSView: NSView {
     func setContent(
         document: WaveformDocument?,
         visibleSignalIDs: [SignalID],
-        viewport: ClosedRange<Double>?
+        viewport: ClosedRange<Double>?,
+        focusedSignalID: SignalID?
     ) {
         let sourceChanged = self.document?.sourceURL != document?.sourceURL
         self.document = document
         self.visibleSignalIDs = visibleSignalIDs
         self.viewportX = viewport
+        self.focusedSignalID = focusedSignalID
         if sourceChanged {
             // New document → stale SignalIDs from the old one are meaningless and any
             // cached decimated traces with those IDs must go.
@@ -220,7 +336,8 @@ final class PlotNSView: NSView {
             ids: visibleSignalIDs,
             boundsSize: bounds.size,
             viewportLowerBits: effective?.lowerBound.bitPattern ?? 0,
-            viewportUpperBits: effective?.upperBound.bitPattern ?? 0
+            viewportUpperBits: effective?.upperBound.bitPattern ?? 0,
+            focusedSignalID: focusedSignalID
         )
         if key == lastRebuildKey {
             return
@@ -515,6 +632,7 @@ final class PlotNSView: NSView {
         // Each signal gets a stable palette color keyed off its SignalID, so the
         // plot trace color always matches the sidebar icon tint for that signal
         // regardless of how many other traces happen to be visible at the same time.
+        // Focused traces render at twice the line width for visual emphasis.
         for (traceIndex, signal) in signals.enumerated() {
             let shape = traceLayers[traceIndex]
             guard signal.values.count > 1 else {
@@ -536,9 +654,11 @@ final class PlotNSView: NSView {
                 plotHeight: height
             )
 
+            let isFocused = (signal.id == focusedSignalID)
             shape.frame = traceContainer.bounds
             shape.path = path
             shape.strokeColor = ColorPalette.stableColor(for: signal.id).cgColor
+            shape.lineWidth = isFocused ? 3.5 : 1.2
             shape.rasterizationScale = rasterScale
         }
     }
