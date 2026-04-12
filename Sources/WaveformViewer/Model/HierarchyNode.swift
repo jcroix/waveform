@@ -87,4 +87,29 @@ public final class HierarchyNode: @unchecked Sendable {
             child.forEach(body)
         }
     }
+
+    /// Returns a filtered copy of the subtree rooted at `node`, keeping only nodes whose
+    /// `name` or `fullPath` contains the needle (case-insensitive) or which have any
+    /// descendant that does. Returns `nil` if nothing in the subtree matches. An empty
+    /// needle returns `node` unchanged (identity is preserved for the no-op case).
+    public static func filter(_ node: HierarchyNode, matching needle: String) -> HierarchyNode? {
+        if needle.isEmpty { return node }
+        let lower = needle.lowercased()
+
+        func walk(_ n: HierarchyNode) -> HierarchyNode? {
+            let selfMatches = n.name.lowercased().contains(lower)
+                || n.fullPath.lowercased().contains(lower)
+            let keptChildren = n.children.compactMap(walk)
+            if selfMatches || !keptChildren.isEmpty {
+                return HierarchyNode(
+                    name: n.name,
+                    fullPath: n.fullPath,
+                    signalID: n.signalID,
+                    children: keptChildren
+                )
+            }
+            return nil
+        }
+        return walk(node)
+    }
 }
