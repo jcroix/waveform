@@ -23,6 +23,20 @@ final class PlotNSView: NSView {
     private var document: WaveformDocument?
     private var visibleSignalIDs: [SignalID] = []
 
+    // MARK: - Viewport
+
+    /// Visible time range. `nil` means "show the full signal span" — the same behavior
+    /// Phases 6 and 7 had. Pinch and scroll-pan mutate this in place; double-click and
+    /// ⌘0 reset it to `nil`. Viewport survives signal-only changes within the same
+    /// document but resets on document changes so a newly-opened file always starts
+    /// zoomed out.
+    private var viewportX: ClosedRange<Double>?
+
+    /// Snapshot of viewport at the start of a pinch. The gesture accumulates a
+    /// magnification delta from zero, so we need the starting viewport to compute
+    /// the new span against a stable baseline.
+    private var pinchStartViewport: ClosedRange<Double>?
+
     // MARK: - Layers
 
     private let traceContainer = CALayer()
@@ -39,13 +53,14 @@ final class PlotNSView: NSView {
     /// rebuild is requested with the same key as the last successful rebuild, we skip the
     /// work entirely — SwiftUI can call `updateNSView` many times per state tick and
     /// `layout()` fires on every NavigationSplitView animation frame, so this dedup is
-    /// load-bearing for keeping the view off the hot path until Phase 7 adds real
-    /// decimation.
+    /// load-bearing for keeping the view off the hot path.
     private struct RebuildKey: Equatable {
         let sourceURL: URL?
         let sampleCount: Int
         let ids: [SignalID]
         let boundsSize: CGSize
+        let viewportLowerBits: UInt64
+        let viewportUpperBits: UInt64
     }
     private var lastRebuildKey: RebuildKey?
 
@@ -94,6 +109,42 @@ final class PlotNSView: NSView {
             "position": NSNull(),
         ]
         root.addSublayer(axisLayer)
+
+        installGestureRecognizers()
+    }
+
+    private func installGestureRecognizers() {
+        let magnify = NSMagnificationGestureRecognizer(
+            target: self,
+            action: #selector(handleMagnify(_:))
+        )
+        addGestureRecognizer(magnify)
+
+        let doubleClick = NSClickGestureRecognizer(
+            target: self,
+            action: #selector(handleDoubleClick(_:))
+        )
+        doubleClick.numberOfClicksRequired = 2
+        addGestureRecognizer(doubleClick)
+    }
+
+    // MARK: - Responder chain
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        // Claim first responder on click so ⌘0 and other key events route here.
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.modifierFlags.contains(.command),
+           event.charactersIgnoringModifiers == "0" {
+            resetViewport()
+            return
+        }
+        super.keyDown(with: event)
     }
 
     @available(*, unavailable)
@@ -140,19 +191,29 @@ final class PlotNSView: NSView {
     // MARK: - Public API
 
     func setContent(document: WaveformDocument?, visibleSignalIDs: [SignalID]) {
+        let sourceChanged = self.document?.sourceURL != document?.sourceURL
         self.document = document
         self.visibleSignalIDs = visibleSignalIDs
+        if sourceChanged {
+            // New document → fresh full-range viewport and a purged decimation cache
+            // (signal IDs from the old document are meaningless in the new one).
+            viewportX = nil
+            decimationCache.removeAll()
+        }
         rebuildIfNeeded()
     }
 
     // MARK: - Coalesced rebuild entry point
 
     private func rebuildIfNeeded() {
+        let effective = effectiveViewport()
         let key = RebuildKey(
             sourceURL: document?.sourceURL,
             sampleCount: document?.sampleCount ?? 0,
             ids: visibleSignalIDs,
-            boundsSize: bounds.size
+            boundsSize: bounds.size,
+            viewportLowerBits: effective?.lowerBound.bitPattern ?? 0,
+            viewportUpperBits: effective?.upperBound.bitPattern ?? 0
         )
         if key == lastRebuildKey {
             return
@@ -160,6 +221,145 @@ final class PlotNSView: NSView {
         lastRebuildKey = key
         axisLayer.setNeedsDisplay()
         rebuildTraces()
+    }
+
+    // MARK: - Viewport helpers
+
+    /// Returns the currently-displayed time range. Falls back to the full span of the
+    /// loaded document's time values when the user hasn't zoomed or panned.
+    private func effectiveViewport() -> ClosedRange<Double>? {
+        if let viewportX = viewportX {
+            return viewportX
+        }
+        return fullSpan()
+    }
+
+    /// Returns the full sample time span of the loaded document, or `nil` if no
+    /// document is loaded or the span is degenerate.
+    private func fullSpan() -> ClosedRange<Double>? {
+        guard let document = document,
+              let tStart = document.timeValues.first,
+              let tEnd = document.timeValues.last,
+              tEnd > tStart else {
+            return nil
+        }
+        return tStart...tEnd
+    }
+
+    /// Reset to full range. Invoked by ⌘0 and double-click.
+    private func resetViewport() {
+        guard viewportX != nil else { return }
+        viewportX = nil
+        rebuildIfNeeded()
+    }
+
+    /// Apply a new visible range, clamped to the full span, and trigger a rebuild if
+    /// anything actually changed.
+    private func applyViewport(_ proposed: ClosedRange<Double>) {
+        guard let full = fullSpan(), proposed.lowerBound < proposed.upperBound else {
+            return
+        }
+
+        // Shift-then-clip so the shape of the range is preserved as long as it fits
+        // inside the full span.
+        var lower = proposed.lowerBound
+        var upper = proposed.upperBound
+
+        if lower < full.lowerBound {
+            let shift = full.lowerBound - lower
+            lower += shift
+            upper += shift
+        }
+        if upper > full.upperBound {
+            let shift = upper - full.upperBound
+            lower -= shift
+            upper -= shift
+        }
+        lower = max(lower, full.lowerBound)
+        upper = min(upper, full.upperBound)
+        guard lower < upper else { return }
+
+        let clamped = lower...upper
+        if clamped == viewportX {
+            return
+        }
+        viewportX = clamped
+        rebuildIfNeeded()
+    }
+
+    // MARK: - Gestures
+
+    @objc private func handleMagnify(_ gesture: NSMagnificationGestureRecognizer) {
+        guard let full = fullSpan() else { return }
+
+        switch gesture.state {
+        case .began:
+            pinchStartViewport = effectiveViewport() ?? full
+        case .changed:
+            guard let start = pinchStartViewport else { return }
+            // gesture.magnification accumulates from zero; positive is zoom-in.
+            let factor = 1.0 + gesture.magnification
+            guard factor > 0.01 else { return }
+
+            let startSpan = start.upperBound - start.lowerBound
+            let newSpan = max(minimumSpan(full: full), startSpan / factor)
+
+            // Keep the time value under the gesture's cursor fixed on screen.
+            let plotArea = computePlotArea()
+            let cursor = gesture.location(in: self)
+            let plotX = max(plotArea.minX, min(plotArea.maxX, cursor.x))
+            let relative = plotArea.width > 0
+                ? Double(plotX - plotArea.minX) / Double(plotArea.width)
+                : 0.5
+            let anchorTime = start.lowerBound + relative * startSpan
+
+            let proposed = (anchorTime - relative * newSpan)...(anchorTime + (1 - relative) * newSpan)
+            applyViewport(proposed)
+        case .ended, .cancelled, .failed:
+            pinchStartViewport = nil
+        default:
+            break
+        }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        // Only consume horizontal scroll for pan. Vertical scroll is reserved for a
+        // future Y-axis mode and falls through to the superclass for now.
+        let deltaX = event.scrollingDeltaX
+        guard deltaX != 0 else {
+            super.scrollWheel(with: event)
+            return
+        }
+
+        guard let current = effectiveViewport() else {
+            super.scrollWheel(with: event)
+            return
+        }
+
+        let plotArea = computePlotArea()
+        guard plotArea.width > 0 else {
+            super.scrollWheel(with: event)
+            return
+        }
+
+        let span = current.upperBound - current.lowerBound
+        // Natural scroll: dragging right (positive deltaX) pans the window to the right
+        // within the content, which means the visible range slides to smaller times.
+        let timeDelta = -Double(deltaX) / Double(plotArea.width) * span
+        let proposed = (current.lowerBound + timeDelta)...(current.upperBound + timeDelta)
+        applyViewport(proposed)
+    }
+
+    @objc private func handleDoubleClick(_ gesture: NSClickGestureRecognizer) {
+        resetViewport()
+    }
+
+    /// Floor on how narrow the viewport can get. We cap at the width of a single
+    /// rendered pixel so decimation can still produce a meaningful envelope.
+    private func minimumSpan(full: ClosedRange<Double>) -> Double {
+        let plotWidth = Double(computePlotArea().width)
+        guard plotWidth > 1 else { return full.upperBound - full.lowerBound }
+        return (full.upperBound - full.lowerBound) / plotWidth
     }
 
     // MARK: - Geometry helpers
@@ -210,11 +410,11 @@ final class PlotNSView: NSView {
             yMaxD += pad
         }
 
-        guard let tStart = document.timeValues.first,
-              let tEnd = document.timeValues.last,
-              tEnd > tStart else {
-            return nil
-        }
+        // Use the zoomed/panned viewport if present, otherwise fall back to the full
+        // sample span. Y range is still computed from the complete signal so the axis
+        // stays stable while panning — users can read absolute values off the Y axis
+        // without the ticks jumping every time they scroll.
+        guard let viewport = effectiveViewport() else { return nil }
 
         // Share the unit across visible signals if they agree; otherwise leave blank so
         // the Y axis shows raw numeric ticks.
@@ -223,8 +423,8 @@ final class PlotNSView: NSView {
 
         return PlotGeometry(
             plotArea: computePlotArea(),
-            tMin: tStart,
-            tMax: tEnd,
+            tMin: viewport.lowerBound,
+            tMax: viewport.upperBound,
             yMin: yMinD,
             yMax: yMaxD,
             unit: unit

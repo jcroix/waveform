@@ -65,6 +65,12 @@ private struct DetailPlaceholder: View {
                 tracesHeader(document: document, signal: signal)
                 Divider()
                 PlotView(document: document, visibleSignalIDs: [selectedID])
+                    // Tying view identity to the source URL forces SwiftUI to rebuild
+                    // the PlotView (and its PlotNSView) whenever the underlying file
+                    // changes, which resets the zoom/pan viewport. Signal-only changes
+                    // within the same document preserve identity, so the viewport
+                    // state survives those as intended.
+                    .id(document.sourceURL)
             }
         } else {
             unselectedSignalState(document: document)
