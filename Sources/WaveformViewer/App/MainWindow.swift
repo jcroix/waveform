@@ -66,8 +66,21 @@ private struct DetailPlaceholder: View {
                 traceLegend(document: document)
                 Divider()
                 plotBody(document: document)
+                Divider()
+                PlotStatusBar(
+                    cursorTime: state.cursorTimeX,
+                    viewport: state.viewportX,
+                    fullSpan: fullSpan(for: document)
+                )
             }
         }
+    }
+
+    private func fullSpan(for document: WaveformDocument) -> ClosedRange<Double>? {
+        guard let start = document.timeValues.first,
+              let end = document.timeValues.last,
+              end > start else { return nil }
+        return start...end
     }
 
     /// Picks a layout strategy based on `state.plotLayout`. In stacked-strips mode,
@@ -108,8 +121,10 @@ private struct DetailPlaceholder: View {
                         ),
                         viewport: state.viewportX,
                         focusedSignalID: state.focusedSignalID,
+                        cursorTimeX: state.cursorTimeX,
                         onViewportChange: { state.viewportX = $0 },
-                        onFocusChange: { state.focusedSignalID = $0 }
+                        onFocusChange: { state.focusedSignalID = $0 },
+                        onCursorChange: { state.cursorTimeX = $0 }
                     )
                     .id(document.sourceURL.absoluteString + "#" + group.unit)
                 }
@@ -130,8 +145,10 @@ private struct DetailPlaceholder: View {
                 assignment: dualAxisAssignment(groups: groups),
                 viewport: state.viewportX,
                 focusedSignalID: state.focusedSignalID,
+                cursorTimeX: state.cursorTimeX,
                 onViewportChange: { state.viewportX = $0 },
-                onFocusChange: { state.focusedSignalID = $0 }
+                onFocusChange: { state.focusedSignalID = $0 },
+                onCursorChange: { state.cursorTimeX = $0 }
             )
             .id(document.sourceURL.absoluteString + "#dualAxis")
         }

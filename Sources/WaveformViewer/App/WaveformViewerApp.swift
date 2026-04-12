@@ -122,6 +122,20 @@ private struct ViewCommands: View {
 
         Divider()
 
+        Button("Go to Time…") {
+            state?.presentGoToTimeDialog()
+        }
+        .keyboardShortcut("g", modifiers: .command)
+        .disabled(state?.document == nil)
+
+        Button("Clear Cursor") {
+            state?.clearCursor()
+        }
+        .keyboardShortcut("l", modifiers: .command)
+        .disabled(state?.cursorTimeX == nil)
+
+        Divider()
+
         // Plot-layout picker renders as a submenu of checked radio items in the
         // macOS menu bar. Selecting a different option mutates the focused
         // window's state so each window can independently choose its layout.

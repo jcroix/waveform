@@ -2,18 +2,20 @@ import AppKit
 import SwiftUI
 
 /// SwiftUI wrapper around an `NSOutlineView` displaying a hierarchical signal tree.
-/// Each leaf row gains a checkbox bound to `ViewerState.visibleSignalIDs`, tinted
-/// with the signal's stable palette color so sidebar and plot colors match.
+/// Each leaf row carries: a checkbox bound to `ViewerState.visibleSignalIDs`, an icon
+/// tinted with the signal's stable palette color, the signal name, and (when a cursor
+/// is placed) the interpolated signal value at the cursor time, right-aligned.
 ///
-/// `visibleSignalIDs` is threaded through as a direct struct property so that the
-/// parent view's body reads it at construction time, which subscribes that view to
-/// the Observation framework. Without that subscription, menu commands that mutate
-/// `state.visibleSignalIDs` would never trigger a `updateNSView` call here and the
-/// checkboxes would fall out of sync.
+/// `visibleSignalIDs` and `cursorTimeX` are threaded through as direct struct
+/// properties so the outer `SignalSidebar` body reads them at construction time and
+/// gets subscribed to them through the Observation framework. Without those reads,
+/// menu commands and plot-driven cursor moves would mutate state but never trigger
+/// `updateNSView` here.
 struct SignalOutlineView: NSViewRepresentable {
     let document: WaveformDocument
     let filterText: String
     let visibleSignalIDs: [SignalID]
+    let cursorTimeX: Double?
     @Bindable var state: ViewerState
 
     func makeCoordinator() -> Coordinator {
@@ -65,13 +67,13 @@ struct SignalOutlineView: NSViewRepresentable {
             context.coordinator.rebuild(document: document, filter: filterText)
             outline.reloadData()
         } else {
-            // Visibility toggles don't change the tree shape but do change the
-            // checkbox state of individual rows — refresh visible cells so the
-            // checkboxes track `state.visibleSignalIDs`.
+            // Neither the tree shape nor the filter changed — we just need to refresh
+            // each visible cell so its checkbox and (cursor-dependent) value stay in
+            // sync with the latest `state.visibleSignalIDs` and `state.cursorTimeX`.
             outline.enumerateAvailableRowViews { rowView, _ in
                 for column in 0..<rowView.numberOfColumns {
                     if let cell = rowView.view(atColumn: column) as? SignalCellView {
-                        cell.refreshCheckboxState()
+                        cell.refreshDynamicContent()
                     }
                 }
             }
@@ -133,7 +135,8 @@ struct SignalOutlineView: NSViewRepresentable {
             let cell = SignalCellView(
                 node: node,
                 signal: signal,
-                state: parent.state
+                state: parent.state,
+                document: parent.document
             )
             return cell
         }
@@ -142,21 +145,34 @@ struct SignalOutlineView: NSViewRepresentable {
 
 // MARK: - Custom cell view
 
-/// Row view for the signal outline. Layout: [checkbox] [icon] [name]. Interior nodes
-/// (no `signalID`) get a folder glyph and no checkbox.
+/// Row view for the signal outline. Layout:
+///
+///     [checkbox] [icon] [name]                 [value]
+///
+/// `value` is populated only when a cursor is placed in the plot and this row
+/// corresponds to a real signal. Interior nodes (no `signalID`) get a folder glyph,
+/// no checkbox, and no value field.
 final class SignalCellView: NSTableCellView {
     private let node: HierarchyNode
     private let signal: Signal?
     private let state: ViewerState
+    private let document: WaveformDocument
 
     private let checkbox = NSButton()
     private let iconView = NSImageView()
     private let nameField = NSTextField(labelWithString: "")
+    private let valueField = NSTextField(labelWithString: "")
 
-    init(node: HierarchyNode, signal: Signal?, state: ViewerState) {
+    init(
+        node: HierarchyNode,
+        signal: Signal?,
+        state: ViewerState,
+        document: WaveformDocument
+    ) {
         self.node = node
         self.signal = signal
         self.state = state
+        self.document = document
         super.init(frame: .zero)
         setupSubviews()
         populate()
@@ -181,11 +197,23 @@ final class SignalCellView: NSTableCellView {
         nameField.translatesAutoresizingMaskIntoConstraints = false
         nameField.font = .systemFont(ofSize: NSFont.systemFontSize)
         nameField.lineBreakMode = .byTruncatingMiddle
+        nameField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         self.textField = nameField
+
+        valueField.translatesAutoresizingMaskIntoConstraints = false
+        valueField.font = .monospacedDigitSystemFont(
+            ofSize: NSFont.smallSystemFontSize,
+            weight: .regular
+        )
+        valueField.textColor = .secondaryLabelColor
+        valueField.alignment = .right
+        valueField.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+        valueField.setContentHuggingPriority(.defaultHigh, for: .horizontal)
 
         addSubview(checkbox)
         addSubview(iconView)
         addSubview(nameField)
+        addSubview(valueField)
 
         NSLayoutConstraint.activate([
             checkbox.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
@@ -199,7 +227,10 @@ final class SignalCellView: NSTableCellView {
 
             nameField.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 6),
             nameField.centerYAnchor.constraint(equalTo: centerYAnchor),
-            nameField.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6),
+            nameField.trailingAnchor.constraint(lessThanOrEqualTo: valueField.leadingAnchor, constant: -8),
+
+            valueField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            valueField.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
 
@@ -216,6 +247,7 @@ final class SignalCellView: NSTableCellView {
         } else {
             // Interior node: no checkbox, folder glyph.
             checkbox.isHidden = true
+            valueField.isHidden = true
             iconView.image = NSImage(
                 systemSymbolName: "folder",
                 accessibilityDescription: nil
@@ -223,12 +255,24 @@ final class SignalCellView: NSTableCellView {
             iconView.contentTintColor = .secondaryLabelColor
         }
 
-        refreshCheckboxState()
+        refreshDynamicContent()
     }
 
-    func refreshCheckboxState() {
+    /// Updates the checkbox (visibility) and value label (cursor readout) to reflect
+    /// the latest state. Called from `SignalOutlineView.updateNSView` whenever
+    /// visibleSignalIDs or cursorTimeX change without touching the tree shape.
+    func refreshDynamicContent() {
         guard let signal = signal else { return }
         checkbox.state = state.isVisible(signal.id) ? .on : .off
+
+        if let cursorTime = state.cursorTimeX,
+           let value = signal.value(atTime: cursorTime, timeValues: document.timeValues) {
+            valueField.stringValue = EngFormat.format(Double(value), unit: signal.unit)
+            valueField.isHidden = false
+        } else {
+            valueField.stringValue = ""
+            valueField.isHidden = true
+        }
     }
 
     @objc private func handleCheckbox(_ sender: NSButton) {
@@ -246,3 +290,4 @@ final class SignalCellView: NSTableCellView {
         }
     }
 }
+

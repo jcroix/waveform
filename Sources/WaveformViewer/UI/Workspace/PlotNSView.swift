@@ -45,6 +45,18 @@ final class PlotNSView: NSView {
 
     private let hitTestRadius: CGFloat = 8
 
+    // MARK: - Cursor
+
+    /// Cursor position in simulation-time units. `nil` if no cursor is placed.
+    /// Supplied by the owning `ViewerState` via `setContent`. The plot draws a
+    /// dashed vertical line at the pixel column matching this time whenever it
+    /// falls inside the current viewport.
+    private var cursorTimeX: Double?
+
+    /// Callback fired when a mouseDown places (or replaces) the cursor. Bound to
+    /// `state.cursorTimeX = newValue`.
+    var onCursorChange: ((Double?) -> Void)?
+
     private var lastClickLocation: CGPoint?
     private var lastCycleCandidates: [SignalID] = []
     private var lastCycleIndex: Int = -1
@@ -74,6 +86,7 @@ final class PlotNSView: NSView {
         let viewportLowerBits: UInt64
         let viewportUpperBits: UInt64
         let focusedSignalID: SignalID?
+        let cursorBits: UInt64?
     }
     private var lastRebuildKey: RebuildKey?
 
@@ -152,6 +165,21 @@ final class PlotNSView: NSView {
         guard event.clickCount == 1 else { return }
 
         let clickLocal = convert(event.locationInWindow, from: nil)
+
+        // Place the cursor at the click's time coordinate whenever the click lands
+        // inside the plot area (regardless of whether any trace was actually hit).
+        // Cursor + selection are independent: a click can hit empty space and still
+        // place a cursor for reading values.
+        let plotArea = computePlotArea()
+        if plotArea.contains(clickLocal),
+           let viewport = effectiveViewport(),
+           plotArea.width > 0 {
+            let fraction = Double(clickLocal.x - plotArea.minX) / Double(plotArea.width)
+            let clamped = min(max(0, fraction), 1)
+            let cursorTime = viewport.lowerBound + clamped * (viewport.upperBound - viewport.lowerBound)
+            onCursorChange?(cursorTime)
+        }
+
         let candidates = hitTestCandidates(at: clickLocal)
 
         if candidates.isEmpty {
@@ -187,7 +215,128 @@ final class PlotNSView: NSView {
             resetViewport()
             return
         }
+        let key = Int(event.keyCode)
+        // kVK_LeftArrow = 123, kVK_RightArrow = 124
+        if key == 123 || key == 124 {
+            let direction: ArrowStepDirection = (key == 123) ? .backward : .forward
+            handleArrowStep(direction: direction, modifiers: event.modifierFlags)
+            return
+        }
         super.keyDown(with: event)
+    }
+
+    private enum ArrowStepDirection { case backward, forward }
+
+    /// Advance the cursor to the previous/next sample in the document's time grid
+    /// and, if the new cursor falls outside the current viewport, slide the viewport
+    /// so the cursor remains visible. Step size depends on modifier keys:
+    /// plain = 1 sample; shift = 10 samples; cmd = jump to the very first/last
+    /// sample. Clamped to the simulation's full time span.
+    private func handleArrowStep(direction: ArrowStepDirection, modifiers: NSEvent.ModifierFlags) {
+        guard let document = document, !document.timeValues.isEmpty else { return }
+
+        // Where to start: existing cursor, or the viewport midpoint if there's no
+        // cursor yet. That way the first arrow press places a cursor rather than
+        // being a no-op.
+        let startTime: Double
+        if let existing = cursorTimeX {
+            startTime = existing
+        } else if let viewport = effectiveViewport() {
+            startTime = (viewport.lowerBound + viewport.upperBound) / 2
+        } else {
+            return
+        }
+
+        // Find the index of the sample nearest to startTime. Binary search for the
+        // first time >= startTime, then pick whichever of that index or the one
+        // before it is closer.
+        let times = document.timeValues
+        var lo = 0
+        var hi = times.count
+        while lo < hi {
+            let mid = (lo + hi) >> 1
+            if times[mid] < startTime {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        var anchorIndex = lo
+        if anchorIndex >= times.count { anchorIndex = times.count - 1 }
+        if anchorIndex > 0 {
+            let a = times[anchorIndex - 1]
+            let b = times[anchorIndex]
+            if abs(startTime - a) <= abs(startTime - b) {
+                anchorIndex -= 1
+            }
+        }
+
+        let step: Int
+        if modifiers.contains(.command) {
+            step = times.count  // effectively jump to the far end
+        } else if modifiers.contains(.shift) {
+            step = 10
+        } else {
+            step = 1
+        }
+
+        // If the cursor was already sitting on an exact sample, arrow one sample
+        // away from it. If it was between samples, snap to the nearest first.
+        let cursorWasOnSample = (abs(times[anchorIndex] - startTime) < 1e-18)
+        let moveSteps = cursorWasOnSample ? step : (step - 1)
+
+        var targetIndex = anchorIndex
+        switch direction {
+        case .backward:
+            targetIndex -= moveSteps
+        case .forward:
+            targetIndex += moveSteps
+        }
+        if !cursorWasOnSample {
+            // When not previously on a sample, always at least snap to the
+            // nearest one in the chosen direction.
+            switch direction {
+            case .backward:
+                if times[anchorIndex] >= startTime {
+                    targetIndex -= 1
+                }
+            case .forward:
+                if times[anchorIndex] <= startTime {
+                    targetIndex += 1
+                }
+            }
+        }
+        targetIndex = max(0, min(times.count - 1, targetIndex))
+        let newTime = times[targetIndex]
+
+        onCursorChange?(newTime)
+        ensureCursorVisible(newTime)
+    }
+
+    /// If `cursorTime` is outside the current viewport, slide the viewport so the
+    /// cursor sits 20% of the span inside the edge it approached from. That larger
+    /// margin means arrow-key navigation scrolls further per overshoot, so the
+    /// user sees more new context on each edge hit instead of pixel-chasing the
+    /// cursor along the border. Clamped to the full sample span via `applyViewport`.
+    private func ensureCursorVisible(_ cursorTime: Double) {
+        guard let viewport = effectiveViewport() else { return }
+        if cursorTime >= viewport.lowerBound && cursorTime <= viewport.upperBound {
+            return
+        }
+        let span = viewport.upperBound - viewport.lowerBound
+        guard span > 0 else { return }
+        let edgeMargin = span * 0.2
+
+        let newLower: Double
+        let newUpper: Double
+        if cursorTime < viewport.lowerBound {
+            newLower = cursorTime - edgeMargin
+            newUpper = newLower + span
+        } else {
+            newUpper = cursorTime + edgeMargin
+            newLower = newUpper - span
+        }
+        applyViewport(newLower...newUpper)
     }
 
     @available(*, unavailable)
@@ -235,13 +384,15 @@ final class PlotNSView: NSView {
         document: WaveformDocument?,
         assignment: PlotTraceAssignment,
         viewport: ClosedRange<Double>?,
-        focusedSignalID: SignalID?
+        focusedSignalID: SignalID?,
+        cursorTimeX: Double?
     ) {
         let sourceChanged = self.document?.sourceURL != document?.sourceURL
         self.document = document
         self.assignment = assignment
         self.viewportX = viewport
         self.focusedSignalID = focusedSignalID
+        self.cursorTimeX = cursorTimeX
         if sourceChanged {
             decimationCache.removeAll()
         }
@@ -276,7 +427,8 @@ final class PlotNSView: NSView {
             boundsSize: bounds.size,
             viewportLowerBits: effective?.lowerBound.bitPattern ?? 0,
             viewportUpperBits: effective?.upperBound.bitPattern ?? 0,
-            focusedSignalID: focusedSignalID
+            focusedSignalID: focusedSignalID,
+            cursorBits: cursorTimeX?.bitPattern
         )
         if key == lastRebuildKey {
             return
@@ -811,6 +963,62 @@ extension PlotNSView: CALayerDelegate {
                 attributes: labelAttributes,
                 in: ctx
             )
+        }
+
+        // Cursor: dashed vertical line plus a time label anchored at the top of the
+        // plot area. Drawn last so it sits on top of tick marks and labels, and only
+        // when the cursor's time value falls inside the current viewport.
+        if let cursorTime = cursorTimeX,
+           cursorTime >= geometry.tMin,
+           cursorTime <= geometry.tMax {
+            let tSpan = geometry.tMax - geometry.tMin
+            guard tSpan > 0 else { return }
+            let fraction = (cursorTime - geometry.tMin) / tSpan
+            let x = plotArea.minX + CGFloat(fraction) * plotArea.width
+
+            ctx.saveGState()
+            ctx.setStrokeColor(NSColor.controlAccentColor.cgColor)
+            ctx.setLineWidth(1.0)
+            ctx.setLineDash(phase: 0, lengths: [4, 3])
+            ctx.move(to: CGPoint(x: x, y: plotArea.minY))
+            ctx.addLine(to: CGPoint(x: x, y: plotArea.maxY))
+            ctx.strokePath()
+            ctx.restoreGState()
+
+            // Small filled "badge" just inside the top of the plot area with the
+            // cursor's time. Kept inside the plot area so the 10pt top margin
+            // doesn't need to grow to accommodate the label. 9 significant
+            // digits so the badge exposes the full Float32 precision of the
+            // underlying TR0 sample times — matches the bottom status bar, and
+            // is what users look at first.
+            let timeText = EngFormat.format(cursorTime, unit: "s", significantDigits: 9)
+            let timeLabelAttributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold),
+                .foregroundColor: NSColor.white,
+            ]
+            let attributed = NSAttributedString(string: timeText, attributes: timeLabelAttributes)
+            let line = CTLineCreateWithAttributedString(attributed)
+            var ascent: CGFloat = 0, descent: CGFloat = 0, leading: CGFloat = 0
+            let textWidth = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, &leading))
+            let textHeight = ascent + descent
+            let padH: CGFloat = 4
+            let padV: CGFloat = 1
+            let badgeWidth = textWidth + padH * 2
+            let badgeHeight = textHeight + padV * 2
+            var badgeX = x - badgeWidth / 2
+            badgeX = max(plotArea.minX + 1, min(plotArea.maxX - badgeWidth - 1, badgeX))
+            let badgeY = plotArea.maxY - badgeHeight - 2
+
+            ctx.saveGState()
+            ctx.setFillColor(NSColor.controlAccentColor.cgColor)
+            let badgeRect = CGRect(x: badgeX, y: badgeY, width: badgeWidth, height: badgeHeight)
+            let badgePath = CGPath(roundedRect: badgeRect, cornerWidth: 3, cornerHeight: 3, transform: nil)
+            ctx.addPath(badgePath)
+            ctx.fillPath()
+            ctx.textMatrix = .identity
+            ctx.textPosition = CGPoint(x: badgeX + padH, y: badgeY + padV + descent)
+            CTLineDraw(line, ctx)
+            ctx.restoreGState()
         }
     }
 

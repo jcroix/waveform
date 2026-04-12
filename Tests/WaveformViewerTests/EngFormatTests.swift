@@ -43,3 +43,42 @@ import Testing
     #expect(EngFormat.format(12.5, unit: "V") == "12.5 V")
     #expect(EngFormat.format(1.25, unit: "V") == "1.25 V")
 }
+
+@Test func higherPrecisionFormat() {
+    // Variable-precision format: status-bar readouts can use 6+ sig figs.
+    #expect(EngFormat.format(17.3248e-9, unit: "s", significantDigits: 6) == "17.3248 ns")
+    #expect(EngFormat.format(1.234567e-6, unit: "s", significantDigits: 6) == "1.23457 µs")
+    // 9 sig figs shows the full Float32 precision, which is what the status bar uses.
+    #expect(EngFormat.format(3.50000e-10, unit: "s", significantDigits: 9) == "350 ps")
+    #expect(EngFormat.format(17.32481234e-9, unit: "s", significantDigits: 9) == "17.3248123 ns")
+}
+
+// MARK: - parseTime
+
+@Test func parseTimePlainSeconds() {
+    #expect(EngFormat.parseTime("1") == 1.0)
+    #expect(EngFormat.parseTime("0.5") == 0.5)
+    #expect(EngFormat.parseTime("1e-9") == 1e-9)
+    #expect(EngFormat.parseTime("1 s") == 1.0)
+}
+
+@Test func parseTimeSIPrefixes() {
+    #expect(EngFormat.parseTime("17ns")! == 17e-9)
+    #expect(EngFormat.parseTime("1.5us")! == 1.5e-6)
+    #expect(EngFormat.parseTime("500 ps")! == 500e-12)
+    #expect(EngFormat.parseTime("2m")! == 2e-3)
+}
+
+@Test func parseTimeWithSuffix() {
+    #expect(EngFormat.parseTime("1e-9 s")! == 1e-9)
+    #expect(EngFormat.parseTime("17 nsec")! == 17e-9)
+    #expect(EngFormat.parseTime("500 ps")! == 500e-12)
+}
+
+@Test func parseTimeInvalidInput() {
+    #expect(EngFormat.parseTime("") == nil)
+    #expect(EngFormat.parseTime("   ") == nil)
+    #expect(EngFormat.parseTime("nonsense") == nil)
+    // Bare SI prefix with no number.
+    #expect(EngFormat.parseTime("n") == nil)
+}

@@ -39,11 +39,11 @@ struct SignalSidebar: View {
             SignalOutlineView(
                 document: document,
                 filterText: state.filterText,
-                // Reading `state.visibleSignalIDs` here subscribes this view to the
-                // property through the Observation framework. Without that access,
-                // menu commands (Show All / Hide All) that mutate visibleSignalIDs
-                // would never cause the sidebar to re-render and refresh checkboxes.
+                // Reading these here subscribes the sidebar to them through the
+                // Observation framework so menu commands, plot clicks, and cursor
+                // moves trigger SwiftUI re-renders and, in turn, `updateNSView`.
                 visibleSignalIDs: state.visibleSignalIDs,
+                cursorTimeX: state.cursorTimeX,
                 state: state
             )
         } else {
