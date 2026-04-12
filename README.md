@@ -6,8 +6,7 @@ GNUplot — interactive, polished, and native to macOS.
 
 ## Status
 
-Early development. The full implementation plan lives in
-`.claude/plans/agile-discovering-bentley.md` (not checked in). Day-one targets:
+Early development. Day-one targets:
 
 - `.tr0` — HSPICE-compatible binary transient output from OmegaSim
 - `.out` — the OmegaSim output listing (run log with embedded waveform tables)
