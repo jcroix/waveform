@@ -29,6 +29,10 @@ final class PlotNSView: NSView {
     private let axisLayer = CALayer()
     private var traceLayers: [CAShapeLayer] = []
 
+    // MARK: - Decimation cache
+
+    private let decimationCache = DecimationCache(maxEntries: 32)
+
     // MARK: - Rebuild coalescing
 
     /// Cache key covering every input that affects the rendered traces and axes. When a
@@ -282,12 +286,18 @@ final class PlotNSView: NSView {
             traceLayers.removeLast().removeFromSuperlayer()
         }
 
-        let tSpan = geometry.tMax - geometry.tMin
         let ySpan = geometry.yMax - geometry.yMin
         let width = Double(geometry.plotArea.width)
         let height = Double(geometry.plotArea.height)
         let timeValues = document.timeValues
         let rasterScale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+
+        // One pixel column per integer point in the plot area width. Decimation buckets
+        // map 1:1 to these columns, so trace rebuild cost becomes O(pixelWidth) rather
+        // than O(sample count) regardless of whether the underlying trace has 26 K or
+        // 10 M points.
+        let pixelWidth = max(1, Int(width.rounded(.up)))
+        let viewport: ClosedRange<Double> = geometry.tMin...geometry.tMax
 
         // Single-trace case: use the kind-based default color so the plot matches the
         // sidebar icon (voltage = yellow, current = blue, …). Multi-trace layouts will
@@ -297,22 +307,24 @@ final class PlotNSView: NSView {
 
         for (traceIndex, signal) in signals.enumerated() {
             let shape = traceLayers[traceIndex]
-            let count = min(signal.values.count, timeValues.count)
-            guard count > 1 else {
+            guard signal.values.count > 1 else {
                 shape.path = nil
                 continue
             }
 
-            let path = CGMutablePath()
-            for i in 0..<count {
-                let x = (timeValues[i] - geometry.tMin) / tSpan * width
-                let y = (Double(signal.values[i]) - geometry.yMin) / ySpan * height
-                if i == 0 {
-                    path.move(to: CGPoint(x: x, y: y))
-                } else {
-                    path.addLine(to: CGPoint(x: x, y: y))
-                }
-            }
+            let decimated = decimationCache.decimatedTrace(
+                for: signal,
+                timeValues: timeValues,
+                viewport: viewport,
+                pixelWidth: pixelWidth
+            )
+
+            let path = buildDecimatedPath(
+                decimated: decimated,
+                yMin: geometry.yMin,
+                ySpan: ySpan,
+                plotHeight: height
+            )
 
             shape.frame = traceContainer.bounds
             shape.path = path
@@ -321,6 +333,42 @@ final class PlotNSView: NSView {
                 : ColorPalette.color(forTraceIndex: traceIndex)).cgColor
             shape.rasterizationScale = rasterScale
         }
+    }
+
+    /// Walks a decimated trace column by column and builds a zigzag polyline that
+    /// visits each populated bucket at `(col, minValue)` followed by `(col, maxValue)`.
+    /// For dense data the zigzag creates a visible envelope (vertical extents per
+    /// column); for sparse data the min and max collapse and the polyline reduces to
+    /// a classic one-line-per-sample trace.
+    private func buildDecimatedPath(
+        decimated: DecimatedTrace,
+        yMin: Double,
+        ySpan: Double,
+        plotHeight: Double
+    ) -> CGPath {
+        let path = CGMutablePath()
+        guard ySpan > 0 else { return path }
+
+        var didMove = false
+        for column in 0..<decimated.pixelWidth {
+            let bucket = decimated.buckets[column]
+            guard bucket.isPopulated else { continue }
+
+            let x = Double(column)
+            let yLow = (Double(bucket.minValue) - yMin) / ySpan * plotHeight
+            let yHigh = (Double(bucket.maxValue) - yMin) / ySpan * plotHeight
+
+            if !didMove {
+                path.move(to: CGPoint(x: x, y: yLow))
+                didMove = true
+            } else {
+                path.addLine(to: CGPoint(x: x, y: yLow))
+            }
+            if yLow != yHigh {
+                path.addLine(to: CGPoint(x: x, y: yHigh))
+            }
+        }
+        return path
     }
 }
 
