@@ -65,19 +65,104 @@ private struct DetailPlaceholder: View {
             VStack(spacing: 0) {
                 traceLegend(document: document)
                 Divider()
-                PlotView(
-                    document: document,
-                    visibleSignalIDs: state.visibleSignalIDs,
-                    viewport: state.viewportX,
-                    focusedSignalID: state.focusedSignalID,
-                    onViewportChange: { state.viewportX = $0 },
-                    onFocusChange: { state.focusedSignalID = $0 }
-                )
-                // Rebuild the plot from scratch when the source file changes so
-                // the viewport and decimation cache fully reset.
-                .id(document.sourceURL)
+                plotBody(document: document)
             }
         }
+    }
+
+    /// Picks a layout strategy based on `state.plotLayout`. In stacked-strips mode,
+    /// traces are grouped by unit and each group gets its own pane stacked vertically;
+    /// a shared viewport in `state.viewportX` keeps the X axes aligned across strips.
+    /// In dual-Y mode, a single pane plots everything with the first unit group on
+    /// the left axis and the second on the right.
+    @ViewBuilder
+    private func plotBody(document: WaveformDocument) -> some View {
+        let groups = state.visibleSignalGroups()
+
+        switch state.plotLayout {
+        case .stackedStrips:
+            stackedStrips(document: document, groups: groups)
+        case .dualYAxis:
+            dualAxisPane(document: document, groups: groups)
+        }
+    }
+
+    @ViewBuilder
+    private func stackedStrips(
+        document: WaveformDocument,
+        groups: [PlotUnitGroup]
+    ) -> some View {
+        if groups.isEmpty {
+            EmptyView()
+        } else {
+            VStack(spacing: 0) {
+                ForEach(Array(groups.enumerated()), id: \.element.id) { index, group in
+                    if index > 0 {
+                        Divider()
+                    }
+                    PlotView(
+                        document: document,
+                        assignment: PlotTraceAssignment(
+                            primarySignalIDs: group.signalIDs,
+                            primaryUnit: group.unit
+                        ),
+                        viewport: state.viewportX,
+                        focusedSignalID: state.focusedSignalID,
+                        onViewportChange: { state.viewportX = $0 },
+                        onFocusChange: { state.focusedSignalID = $0 }
+                    )
+                    .id(document.sourceURL.absoluteString + "#" + group.unit)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func dualAxisPane(
+        document: WaveformDocument,
+        groups: [PlotUnitGroup]
+    ) -> some View {
+        if groups.isEmpty {
+            EmptyView()
+        } else {
+            PlotView(
+                document: document,
+                assignment: dualAxisAssignment(groups: groups),
+                viewport: state.viewportX,
+                focusedSignalID: state.focusedSignalID,
+                onViewportChange: { state.viewportX = $0 },
+                onFocusChange: { state.focusedSignalID = $0 }
+            )
+            .id(document.sourceURL.absoluteString + "#dualAxis")
+        }
+    }
+
+    /// Maps an ordered list of unit groups onto a dual-axis plot assignment. The first
+    /// group goes on the left (primary) Y axis; the second on the right (secondary).
+    /// Any additional groups are folded onto the primary axis since the plot only has
+    /// two axes to offer — users with three or more unit kinds in a single window
+    /// should use stacked strips instead, which gives each unit its own pane.
+    private func dualAxisAssignment(groups: [PlotUnitGroup]) -> PlotTraceAssignment {
+        let primary = groups[0]
+        let secondary: PlotUnitGroup? = groups.count >= 2 ? groups[1] : nil
+
+        var primaryIDs = primary.signalIDs
+        var primaryUnit = primary.unit
+        if groups.count > 2 {
+            for group in groups[2...] {
+                primaryIDs.append(contentsOf: group.signalIDs)
+            }
+            if !primaryUnit.isEmpty {
+                primaryUnit += "*"  // hint that the primary axis mixes units
+            }
+        }
+
+        return PlotTraceAssignment(
+            primarySignalIDs: primaryIDs,
+            primaryUnit: primaryUnit,
+            secondarySignalIDs: secondary?.signalIDs ?? [],
+            secondaryUnit: secondary?.unit ?? ""
+        )
     }
 
     @ViewBuilder

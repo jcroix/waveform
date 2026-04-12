@@ -4,7 +4,8 @@ import Observation
 
 /// The top-level app-wide state for a single viewer window. Owned by the `WaveformViewerApp`
 /// scene as `@State` and passed to subviews via `@Bindable`. One instance per window scene;
-/// Phase 14 will revisit multi-window ownership and optional cross-window sync.
+/// Phase 14 introduced multi-window support — each `WindowGroup` window gets its own
+/// `ViewerState` and menu commands route to the focused window via `@FocusedValue`.
 @Observable @MainActor
 public final class ViewerState {
     // MARK: - Document
@@ -19,23 +20,31 @@ public final class ViewerState {
     // MARK: - Visible traces
 
     /// Ordered list of signals currently plotted. The order IS the z-order: the last
-    /// element is drawn on top. Phase 9.2 will expose move-to-front / move-to-back
-    /// commands that rearrange this array.
+    /// element is drawn on top. Phase 9.2 added move-to-front / move-to-back commands
+    /// that rearrange this array.
     public var visibleSignalIDs: [SignalID] = []
 
-    /// Signal the user has focused by clicking a trace in the plot area. Used by
-    /// Phase 9.1+ to render the focused trace at a heavier line width. `nil` means no
-    /// trace is focused; clicking in empty plot area sets this back to `nil`.
+    /// Signal the user has focused by clicking a trace in the plot area. Used to
+    /// render the focused trace at a heavier line width and to target the
+    /// move-to-front / move-to-back commands. Cleared by toggleVisibility when the
+    /// focused signal is hidden, by hideAllSignals, and by open(url:).
     public var focusedSignalID: SignalID?
 
     // MARK: - Plot viewport
 
     /// Visible time range on the X axis. `nil` means "full sample span". Pinch and
     /// scroll-pan gestures mutate this in place; menu commands (View → Zoom to Fit)
-    /// and ⌘0 reset it to `nil`. Viewport is deliberately per-state, so Phase 14 can
-    /// either keep it per-window (independent) or move it to a shared value for
-    /// linked-zoom mode.
+    /// and ⌘0 reset it to `nil`. Viewport is deliberately per-state, so cross-window
+    /// linked-zoom mode can share it later by pointing multiple windows at the same
+    /// underlying viewport.
     public var viewportX: ClosedRange<Double>?
+
+    // MARK: - Plot layout
+
+    /// How traces with different units are arranged in this window. Defaults to
+    /// stacked strips, which gives each unit its own auto-scaled Y axis in a
+    /// separate pane.
+    public var plotLayout: PlotLayout = .stackedStrips
 
     public init() {}
 
@@ -100,7 +109,7 @@ public final class ViewerState {
         }
     }
 
-    /// Show every signal in the loaded document. No-op if no document is loaded.
+    /// Show every signal in the loaded document.
     public func showAllSignals() {
         guard let document = document else { return }
         visibleSignalIDs = document.signals.map(\.id)
@@ -141,4 +150,33 @@ public final class ViewerState {
     public func resetViewport() {
         viewportX = nil
     }
+
+    // MARK: - Signal grouping for plot layout
+
+    /// Groups the visible signal IDs by unit, preserving `visibleSignalIDs` z-order
+    /// within each group. Returns an ordered array: the first unit encountered in
+    /// the visible list appears first. Used by the stacked-strips plot layout to
+    /// give each unit (V, A, W, L, …) its own pane with its own auto-scaled Y axis.
+    public func visibleSignalGroups() -> [PlotUnitGroup] {
+        guard let document = document else { return [] }
+        var groupsByUnit: [String: PlotUnitGroup] = [:]
+        var unitOrder: [String] = []
+        for id in visibleSignalIDs {
+            guard let signal = document.signal(withID: id) else { continue }
+            let unit = signal.unit
+            if groupsByUnit[unit] == nil {
+                groupsByUnit[unit] = PlotUnitGroup(unit: unit, signalIDs: [])
+                unitOrder.append(unit)
+            }
+            groupsByUnit[unit]?.signalIDs.append(id)
+        }
+        return unitOrder.compactMap { groupsByUnit[$0] }
+    }
+}
+
+public struct PlotUnitGroup: Sendable, Equatable, Identifiable {
+    public var unit: String
+    public var signalIDs: [SignalID]
+
+    public var id: String { unit }
 }

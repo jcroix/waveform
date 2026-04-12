@@ -6,7 +6,7 @@ import SwiftUI
 /// back to the state.
 struct PlotView: NSViewRepresentable {
     let document: WaveformDocument
-    let visibleSignalIDs: [SignalID]
+    let assignment: PlotTraceAssignment
     let viewport: ClosedRange<Double>?
     let focusedSignalID: SignalID?
     var onViewportChange: (ClosedRange<Double>?) -> Void
@@ -18,7 +18,7 @@ struct PlotView: NSViewRepresentable {
         view.onFocusChange = onFocusChange
         view.setContent(
             document: document,
-            visibleSignalIDs: visibleSignalIDs,
+            assignment: assignment,
             viewport: viewport,
             focusedSignalID: focusedSignalID
         )
@@ -30,7 +30,7 @@ struct PlotView: NSViewRepresentable {
         nsView.onFocusChange = onFocusChange
         nsView.setContent(
             document: document,
-            visibleSignalIDs: visibleSignalIDs,
+            assignment: assignment,
             viewport: viewport,
             focusedSignalID: focusedSignalID
         )

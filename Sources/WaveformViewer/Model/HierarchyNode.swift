@@ -112,4 +112,5 @@ public final class HierarchyNode: @unchecked Sendable {
         }
         return walk(node)
     }
+
 }
