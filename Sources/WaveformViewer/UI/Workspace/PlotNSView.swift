@@ -55,6 +55,18 @@ final class PlotNSView: NSView {
     /// click to count as a hit on that trace. Anything beyond this deselects.
     private let hitTestRadius: CGFloat = 8
 
+    /// Sticky cycling state: repeated clicks at (approximately) the same pixel
+    /// location cycle through the ordered list of hit candidates from the previous
+    /// click, giving the user access to traces underneath the visually topmost one.
+    private var lastClickLocation: CGPoint?
+    private var lastCycleCandidates: [SignalID] = []
+    private var lastCycleIndex: Int = -1
+
+    /// Maximum pixel drift between consecutive clicks that still counts as "same
+    /// location" for cycling. A bit of slop lets users tap quickly without having
+    /// to hold the mouse perfectly still.
+    private let cycleLocationTolerance: CGFloat = 3
+
     // MARK: - Layers
 
     private let traceContainer = CALayer()
@@ -164,54 +176,82 @@ final class PlotNSView: NSView {
 
         let clickWindow = event.locationInWindow
         let clickLocal = convert(clickWindow, from: nil)
-        // Sample a small neighborhood of columns around the click to tolerate bucket
-        // edges and sub-pixel click positions. See `hitTestTrace(at:)`.
-        let hit = hitTestTrace(at: clickLocal)
-        onFocusChange?(hit)
+        let candidates = hitTestCandidates(at: clickLocal)
+
+        if candidates.isEmpty {
+            // Click landed in empty plot area — deselect and forget any cycling state.
+            lastClickLocation = nil
+            lastCycleCandidates = []
+            lastCycleIndex = -1
+            onFocusChange?(nil)
+            return
+        }
+
+        // If this click is "at the same place" as the last one and the candidate
+        // set is identical, cycle forward through the list. Otherwise start a
+        // fresh selection at the closest candidate.
+        let sameLocation = lastClickLocation.map { previous in
+            abs(previous.x - clickLocal.x) <= cycleLocationTolerance &&
+            abs(previous.y - clickLocal.y) <= cycleLocationTolerance
+        } ?? false
+        let sameCandidates = (candidates == lastCycleCandidates)
+
+        let selectedIndex: Int
+        if sameLocation && sameCandidates && candidates.count > 1 {
+            selectedIndex = (lastCycleIndex + 1) % candidates.count
+        } else {
+            selectedIndex = 0
+        }
+
+        lastClickLocation = clickLocal
+        lastCycleCandidates = candidates
+        lastCycleIndex = selectedIndex
+        onFocusChange?(candidates[selectedIndex])
     }
 
-    /// Returns the `SignalID` of the trace closest to `point`, or `nil` if no trace is
-    /// within `hitTestRadius`. Scans the click's pixel column **and a few adjacent
-    /// columns** so a click that lands on a bucket boundary (or a sparse bucket whose
-    /// neighbor carries the actual sample) still hits. Distances are Euclidean in
-    /// pixel space, which matters when a nearby bucket's X offset is a few pixels away
-    /// from the click. On ties, the trace drawn later in the z-order wins.
-    private func hitTestTrace(at point: CGPoint) -> SignalID? {
+    /// Returns every `SignalID` within `hitTestRadius` of `point`, sorted by
+    /// pixel distance ascending (closest first). Ties are broken in favor of
+    /// the trace drawn later in the z-order (visually on top), which mirrors
+    /// what the user sees. Scans a column neighborhood so a click that lands
+    /// on a bucket boundary or a sparse bucket still finds the real trace.
+    /// Used both for single-selection (pick candidates[0]) and for cycling
+    /// through stacked traces on repeated clicks at the same location.
+    private func hitTestCandidates(at point: CGPoint) -> [SignalID] {
         let plotArea = computePlotArea()
-        guard plotArea.contains(point) else { return nil }
+        guard plotArea.contains(point) else { return [] }
 
         guard let document = document,
               let geometry = computeGeometry() else {
-            return nil
+            return []
         }
 
         let signals = visibleSignalIDs.compactMap { document.signal(withID: $0) }
-        guard !signals.isEmpty else { return nil }
+        guard !signals.isEmpty else { return [] }
 
         let plotWidth = Double(plotArea.width)
         let plotHeight = Double(plotArea.height)
-        guard plotWidth > 1, plotHeight > 1 else { return nil }
+        guard plotWidth > 1, plotHeight > 1 else { return [] }
 
         let pixelWidth = max(1, Int(plotArea.width.rounded(.up)))
         let viewport = geometry.tMin...geometry.tMax
         let ySpan = geometry.yMax - geometry.yMin
-        guard ySpan > 0 else { return nil }
+        guard ySpan > 0 else { return [] }
 
-        // Click position in plot-local coordinates. Truncate the x offset to get the
-        // column that visually contains the click (matches the `Int(normalized * W)`
-        // column mapping used by `Decimator.decimate`).
         let clickXOffset = Double(point.x - plotArea.minX)
         let clickY = Double(point.y - plotArea.minY)
         let centerColumn = Int(clickXOffset)
         let radius = Double(hitTestRadius)
-        // Scan the click column plus `hitTestRadius` columns on either side. That way
-        // a click that lands in a bucket with no samples (sparse trace) or between two
-        // bucket centers still finds the trace the user intended.
         let scanRadius = Int(ceil(radius))
         let lowColumn = max(0, centerColumn - scanRadius)
         let highColumn = min(pixelWidth - 1, centerColumn + scanRadius)
 
-        var best: (signalID: SignalID, traceIndex: Int, distance: Double)?
+        // Best distance per trace (closest column the click fell within radius of).
+        struct Match {
+            let signalID: SignalID
+            let traceIndex: Int
+            var distance: Double
+        }
+        var matches: [SignalID: Match] = [:]
 
         for (traceIndex, signal) in signals.enumerated() {
             let decimated = decimationCache.decimatedTrace(
@@ -230,8 +270,6 @@ final class PlotNSView: NSView {
                 let yLow = (Double(bucket.minValue) - geometry.yMin) / ySpan * plotHeight
                 let yHigh = (Double(bucket.maxValue) - geometry.yMin) / ySpan * plotHeight
 
-                // Closest point on the vertical segment [bucketX, yLow..yHigh] to the
-                // click (bucketX is the segment's x; y is clamped to [yLow, yHigh]).
                 let clampedY = max(yLow, min(yHigh, clickY))
                 let dx = clickXOffset - bucketX
                 let dy = clickY - clampedY
@@ -239,20 +277,33 @@ final class PlotNSView: NSView {
 
                 guard distance <= radius else { continue }
 
-                if let current = best {
-                    // Prefer closer traces. On ties, prefer the one later in the
-                    // z-order (visually on top).
-                    if distance < current.distance ||
-                       (distance == current.distance && traceIndex > current.traceIndex) {
-                        best = (signal.id, traceIndex, distance)
+                if let existing = matches[signal.id] {
+                    if distance < existing.distance {
+                        matches[signal.id] = Match(
+                            signalID: signal.id,
+                            traceIndex: traceIndex,
+                            distance: distance
+                        )
                     }
                 } else {
-                    best = (signal.id, traceIndex, distance)
+                    matches[signal.id] = Match(
+                        signalID: signal.id,
+                        traceIndex: traceIndex,
+                        distance: distance
+                    )
                 }
             }
         }
 
-        return best?.signalID
+        // Sort: closest first, tie-break by larger traceIndex (later in z-order = on top).
+        return matches.values
+            .sorted { lhs, rhs in
+                if lhs.distance != rhs.distance {
+                    return lhs.distance < rhs.distance
+                }
+                return lhs.traceIndex > rhs.traceIndex
+            }
+            .map(\.signalID)
     }
 
     override func keyDown(with event: NSEvent) {

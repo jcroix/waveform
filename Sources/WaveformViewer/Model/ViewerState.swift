@@ -112,6 +112,29 @@ public final class ViewerState {
         focusedSignalID = nil
     }
 
+    // MARK: - Z-order (Phase 9.2)
+
+    /// Move the focused trace to the top of the z-order (drawn last = on top).
+    /// No-op if no trace is focused or the focused trace isn't visible.
+    public func moveFocusedToFront() {
+        guard let id = focusedSignalID,
+              let index = visibleSignalIDs.firstIndex(of: id),
+              index != visibleSignalIDs.count - 1 else { return }
+        visibleSignalIDs.remove(at: index)
+        visibleSignalIDs.append(id)
+    }
+
+    /// Move the focused trace to the bottom of the z-order (drawn first = behind
+    /// every other trace). No-op if no trace is focused or the focused trace isn't
+    /// visible.
+    public func moveFocusedToBack() {
+        guard let id = focusedSignalID,
+              let index = visibleSignalIDs.firstIndex(of: id),
+              index != 0 else { return }
+        visibleSignalIDs.remove(at: index)
+        visibleSignalIDs.insert(id, at: 0)
+    }
+
     // MARK: - Viewport commands
 
     /// Reset the X-axis viewport to the full sample span.

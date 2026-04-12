@@ -48,6 +48,20 @@ struct WaveformViewerApp: App {
                 }
                 .keyboardShortcut("h", modifiers: [.command, .shift])
                 .disabled(state.document == nil || state.visibleSignalIDs.isEmpty)
+
+                Divider()
+
+                Button("Bring Trace to Front") {
+                    state.moveFocusedToFront()
+                }
+                .keyboardShortcut("]", modifiers: [.command, .shift])
+                .disabled(state.focusedSignalID == nil)
+
+                Button("Send Trace to Back") {
+                    state.moveFocusedToBack()
+                }
+                .keyboardShortcut("[", modifiers: [.command, .shift])
+                .disabled(state.focusedSignalID == nil)
             }
         }
     }
