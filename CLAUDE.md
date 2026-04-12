@@ -12,12 +12,19 @@ A Mac-native SPICE waveform viewer for OmegaSim simulation output, replacing the
 swift build                          # compile
 swift test                           # run all tests
 swift test --filter <test-name>      # run a single Swift Testing @Test by name
-swift run WaveformViewer             # launch the app (⌘O to open a file)
+./scripts/make-app.sh [debug|release] # build a proper .app bundle (debug by default)
+open .build/debug/WaveformViewer.app  # launch the bundled app
 ```
 
-### Un-bundled activation gotcha
+### Always launch via the `.app` bundle, not `swift run`
 
-`swift run` launches an executable with no `.app` bundle, so the process starts as a background/accessory app by default — no dock icon, no focus, no key events, and `NSOpenPanel` loses focus the moment the user clicks into it. `AppDelegate.applicationDidFinishLaunching` calls `NSApp.setActivationPolicy(.regular)` and `NSApp.activate(ignoringOtherApps:)` to promote the process. If focus, key events, or open panels start misbehaving after edits to the app entry point, that's the first place to look.
+`swift run WaveformViewer` *technically* works, but on macOS 14+ it launches an un-bundled Mach-O executable with no `Info.plist`. Without the bundle, macOS falls into degraded windowing behavior (no dock icon, no focus, `NSOpenPanel` loses focus on click, elevated WindowServer CPU because the process isn't registered as a regular application). `scripts/make-app.sh` wraps the compiled binary in an `.app` with the minimal `Info.plist` keys macOS actually wants (`NSHighResolutionCapable`, `NSPrincipalClass`, `CFBundleIdentifier`, `NSSupportsAutomaticGraphicsSwitching`). Prefer it.
+
+`AppDelegate.applicationDidFinishLaunching` also calls `NSApp.setActivationPolicy(.regular)` + `NSApp.activate(ignoringOtherApps:)` as a safety net so the process still behaves like a foreground app even if someone does launch via `swift run`.
+
+### Do NOT reintroduce `.toolbar` on the main window
+
+On macOS 26.x (observed on Darwin 25.4 with Swift 6.3), attaching any `.toolbar { … }` to the main window — even a single `ToolbarItem { Button("Open") { … } }` with no SF Symbol and no placement override — pegs `WindowServer` at 30–50% CPU at idle, presumably because of continuous window-chrome compositing. The main window deliberately has **no toolbar**; the File → Open command is wired via `WaveformViewerApp.commands` (⌘O) and the empty-state `ContentUnavailableView` in `MainWindow.swift` carries an in-content "Open…" button so there is still a visible affordance. This was bisected by stripping `MainWindow` to a minimal view and progressively adding pieces back. If you find yourself wanting to add a toolbar, re-test WindowServer CPU with `top` first and revert if it spikes.
 
 ## Architecture
 
@@ -56,6 +63,30 @@ Signal-kind classification looks at different signals in each parser: `ListingPa
 - `ViewerState` (`@Observable @MainActor`) owns the current document, filter text, selected signal ID, and load error. One instance per window scene.
 - `SignalSidebar` → `SignalOutlineView` wraps `NSOutlineView` via `NSViewRepresentable`. SwiftUI `OutlineGroup` is **intentionally not used** — it scales quadratically and SPICE circuits routinely have thousands of signals. Uses `NSTableView.style = .sourceList` (the non-deprecated form), not the older `selectionHighlightStyle = .sourceList`.
 - GUI idioms in this project are drawn **only from commercial waveform viewers** — Cadence ViVA, Synopsys Custom WaveView, Mentor/Siemens EZwave, Keysight ADS. Freeware viewers (LTSpice, GTKWave, PulseView, Saleae) are explicitly out of scope as design references per the user's guidance.
+
+### Plot panel
+
+`PlotNSView` is a layer-backed `NSView` wrapped by `PlotView` (`NSViewRepresentable`). The layer stack, bottom → top:
+
+1. **view root layer** — background fill, separator border
+2. **`traceContainer`** — `frame = plotArea` (after margin insets), `masksToBounds = true`. Children are reused `CAShapeLayer`s, one per visible signal, with paths in plot-area-local coordinates.
+3. **`axisLayer`** (zPosition = 1, delegate-drawn via `CALayerDelegate.draw(_:in:)`) — draws axis borders, tick marks, and engineering-notation tick labels via Core Text.
+
+Placing the axis layer above the trace container via zPosition means tick marks and labels cannot be overdrawn by waveform data, which was an explicit user requirement.
+
+**Critical performance invariants** (the view was observed pegging WindowServer at 100%+ CPU before these fixes landed):
+
+- Trace layers are **reused** across rebuilds via a pool; only `.path` and `.strokeColor` are updated in place. Recreating `CAShapeLayer`s every rebuild invalidates CA's rasterization cache and forces WindowServer to re-rasterize the full polyline on every composite.
+- Each trace layer has **`shouldRasterize = true`** with `rasterizationScale = backingScaleFactor`. CA rasterizes the polyline once into an offscreen bitmap and composites the cached bitmap on subsequent frames.
+- A `RebuildKey` (source URL + sample count + signal IDs + bounds size) guards `rebuildIfNeeded()`. Layout passes and SwiftUI `updateNSView` calls that don't change any input return immediately without touching any layer.
+- Implicit CA animations are suppressed at every mutation point: `actions = ["path": NSNull(), "strokeColor": NSNull(), …]` on every shape layer, `CATransaction.setDisableActions(true)` around every rebuild.
+- Dynamic system colors on the root layer and axis labels are re-resolved inside `effectiveAppearance.performAsCurrentDrawingAppearance { … }` on `viewDidChangeEffectiveAppearance`, and `lastRebuildKey` is cleared so the dedupe cache doesn't short-circuit that rebuild.
+
+**Pure utilities used by the plot panel** (all unit-tested in isolation):
+
+- `EngFormat.format(_:unit:)` — engineering-notation formatter (f, p, n, µ, m, k, M, G, T) with 3 significant digits and trailing-zero stripping. Used for both time (`"50 ns"`) and value (`"-2.5 mA"`) labels.
+- `AxisTicks.niceTicks(min:max:target:)` — "nice number" tick generator via the 1-2-5 rounding rule (Heckbert). Returns a sorted list of tick positions covering the inclusive range.
+- `ColorPalette.color(for: SignalKind)` — kind-based trace color for single-trace plots (voltage=yellow, current=blue, …) so the plot matches the sidebar icon tint. `ColorPalette.color(forTraceIndex:)` is a round-robin palette reserved for multi-trace layouts arriving in Phase 9+.
 
 ## Test fixtures
 
