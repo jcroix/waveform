@@ -1,13 +1,20 @@
 import AppKit
 import SwiftUI
 
-/// SwiftUI wrapper around an `NSOutlineView` displaying a hierarchical signal tree. Source
-/// list styling gives it the native vibrant sidebar look; filtering rebuilds a subset of
-/// the tree and reloads the outline view.
+/// SwiftUI wrapper around an `NSOutlineView` displaying a hierarchical signal tree.
+/// Each leaf row gains a checkbox bound to `ViewerState.visibleSignalIDs`, tinted
+/// with the signal's stable palette color so sidebar and plot colors match.
+///
+/// `visibleSignalIDs` is threaded through as a direct struct property so that the
+/// parent view's body reads it at construction time, which subscribes that view to
+/// the Observation framework. Without that subscription, menu commands that mutate
+/// `state.visibleSignalIDs` would never trigger a `updateNSView` call here and the
+/// checkboxes would fall out of sync.
 struct SignalOutlineView: NSViewRepresentable {
     let document: WaveformDocument
     let filterText: String
-    @Binding var selectedSignalID: SignalID?
+    let visibleSignalIDs: [SignalID]
+    @Bindable var state: ViewerState
 
     func makeCoordinator() -> Coordinator {
         Coordinator(parent: self)
@@ -17,6 +24,7 @@ struct SignalOutlineView: NSViewRepresentable {
         let outline = NSOutlineView(frame: .zero)
         outline.headerView = nil
         outline.allowsMultipleSelection = false
+        outline.allowsEmptySelection = true
         outline.autoresizesOutlineColumn = true
         outline.indentationPerLevel = 14
         outline.style = .sourceList
@@ -34,8 +42,6 @@ struct SignalOutlineView: NSViewRepresentable {
         let coordinator = context.coordinator
         outline.dataSource = coordinator
         outline.delegate = coordinator
-        outline.target = coordinator
-        outline.doubleAction = #selector(Coordinator.handleDoubleClick(_:))
 
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
@@ -58,6 +64,17 @@ struct SignalOutlineView: NSViewRepresentable {
         if context.coordinator.needsRebuild(document: document, filter: filterText) {
             context.coordinator.rebuild(document: document, filter: filterText)
             outline.reloadData()
+        } else {
+            // Visibility toggles don't change the tree shape but do change the
+            // checkbox state of individual rows — refresh visible cells so the
+            // checkboxes track `state.visibleSignalIDs`.
+            outline.enumerateAvailableRowViews { rowView, _ in
+                for column in 0..<rowView.numberOfColumns {
+                    if let cell = rowView.view(atColumn: column) as? SignalCellView {
+                        cell.refreshCheckboxState()
+                    }
+                }
+            }
         }
     }
 
@@ -112,83 +129,120 @@ struct SignalOutlineView: NSViewRepresentable {
             item: Any
         ) -> NSView? {
             guard let node = item as? HierarchyNode else { return nil }
-
-            let cell = NSTableCellView()
-
-            let image = NSImageView()
-            image.translatesAutoresizingMaskIntoConstraints = false
-            image.imageScaling = .scaleProportionallyDown
-            cell.addSubview(image)
-            cell.imageView = image
-
-            let text = NSTextField(labelWithString: node.name)
-            text.font = .systemFont(ofSize: NSFont.systemFontSize)
-            text.lineBreakMode = .byTruncatingMiddle
-            text.translatesAutoresizingMaskIntoConstraints = false
-            cell.addSubview(text)
-            cell.textField = text
-
-            if let signalID = node.signalID,
-               let signal = parent.document.signal(withID: signalID) {
-                image.image = NSImage(
-                    systemSymbolName: iconName(for: signal.kind),
-                    accessibilityDescription: nil
-                )
-                image.contentTintColor = iconColor(for: signal.kind)
-            } else {
-                image.image = NSImage(
-                    systemSymbolName: "folder",
-                    accessibilityDescription: nil
-                )
-                image.contentTintColor = .secondaryLabelColor
-            }
-
-            NSLayoutConstraint.activate([
-                image.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
-                image.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-                image.widthAnchor.constraint(equalToConstant: 16),
-                image.heightAnchor.constraint(equalToConstant: 16),
-                text.leadingAnchor.constraint(equalTo: image.trailingAnchor, constant: 6),
-                text.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-                text.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -6),
-            ])
-
+            let signal: Signal? = node.signalID.flatMap { parent.document.signal(withID: $0) }
+            let cell = SignalCellView(
+                node: node,
+                signal: signal,
+                state: parent.state
+            )
             return cell
         }
+    }
+}
 
-        func outlineViewSelectionDidChange(_ notification: Notification) {
-            guard let outline = notification.object as? NSOutlineView else { return }
-            let row = outline.selectedRow
-            if row >= 0, let node = outline.item(atRow: row) as? HierarchyNode {
-                parent.selectedSignalID = node.signalID
-            } else {
-                parent.selectedSignalID = nil
-            }
+// MARK: - Custom cell view
+
+/// Row view for the signal outline. Layout: [checkbox] [icon] [name]. Interior nodes
+/// (no `signalID`) get a folder glyph and no checkbox.
+final class SignalCellView: NSTableCellView {
+    private let node: HierarchyNode
+    private let signal: Signal?
+    private let state: ViewerState
+
+    private let checkbox = NSButton()
+    private let iconView = NSImageView()
+    private let nameField = NSTextField(labelWithString: "")
+
+    init(node: HierarchyNode, signal: Signal?, state: ViewerState) {
+        self.node = node
+        self.signal = signal
+        self.state = state
+        super.init(frame: .zero)
+        setupSubviews()
+        populate()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    private func setupSubviews() {
+        checkbox.translatesAutoresizingMaskIntoConstraints = false
+        checkbox.setButtonType(.switch)
+        checkbox.title = ""
+        checkbox.imagePosition = .imageOnly
+        checkbox.target = self
+        checkbox.action = #selector(handleCheckbox(_:))
+
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.imageScaling = .scaleProportionallyDown
+
+        nameField.translatesAutoresizingMaskIntoConstraints = false
+        nameField.font = .systemFont(ofSize: NSFont.systemFontSize)
+        nameField.lineBreakMode = .byTruncatingMiddle
+        self.textField = nameField
+
+        addSubview(checkbox)
+        addSubview(iconView)
+        addSubview(nameField)
+
+        NSLayoutConstraint.activate([
+            checkbox.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            checkbox.centerYAnchor.constraint(equalTo: centerYAnchor),
+            checkbox.widthAnchor.constraint(equalToConstant: 16),
+
+            iconView.leadingAnchor.constraint(equalTo: checkbox.trailingAnchor, constant: 4),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 16),
+            iconView.heightAnchor.constraint(equalToConstant: 16),
+
+            nameField.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 6),
+            nameField.centerYAnchor.constraint(equalTo: centerYAnchor),
+            nameField.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6),
+        ])
+    }
+
+    private func populate() {
+        nameField.stringValue = node.name
+
+        if let signal = signal {
+            checkbox.isHidden = false
+            iconView.image = NSImage(
+                systemSymbolName: iconName(for: signal.kind),
+                accessibilityDescription: nil
+            )
+            iconView.contentTintColor = ColorPalette.stableColor(for: signal.id)
+        } else {
+            // Interior node: no checkbox, folder glyph.
+            checkbox.isHidden = true
+            iconView.image = NSImage(
+                systemSymbolName: "folder",
+                accessibilityDescription: nil
+            )
+            iconView.contentTintColor = .secondaryLabelColor
         }
 
-        @objc func handleDoubleClick(_ sender: Any?) {
-            // Placeholder for the Phase 9 "add to plot" flow. Until the plot panel exists
-            // there is nothing to do with a double-click.
-        }
+        refreshCheckboxState()
+    }
 
-        private func iconName(for kind: SignalKind) -> String {
-            switch kind {
-            case .voltage:      return "bolt.fill"
-            case .current:      return "arrow.left.and.right.circle.fill"
-            case .power:        return "sun.max.fill"
-            case .logicVoltage: return "waveform.path"
-            case .unknown:      return "questionmark.circle"
-            }
-        }
+    func refreshCheckboxState() {
+        guard let signal = signal else { return }
+        checkbox.state = state.isVisible(signal.id) ? .on : .off
+    }
 
-        private func iconColor(for kind: SignalKind) -> NSColor {
-            switch kind {
-            case .voltage:      return .systemYellow
-            case .current:      return .systemBlue
-            case .power:        return .systemOrange
-            case .logicVoltage: return .systemPurple
-            case .unknown:      return .secondaryLabelColor
-            }
+    @objc private func handleCheckbox(_ sender: NSButton) {
+        guard let signal = signal else { return }
+        state.toggleVisibility(signal.id)
+    }
+
+    private func iconName(for kind: SignalKind) -> String {
+        switch kind {
+        case .voltage:      return "bolt.fill"
+        case .current:      return "arrow.left.and.right.circle.fill"
+        case .power:        return "sun.max.fill"
+        case .logicVoltage: return "waveform.path"
+        case .unknown:      return "questionmark.circle"
         }
     }
 }

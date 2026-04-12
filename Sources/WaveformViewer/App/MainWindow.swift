@@ -24,7 +24,7 @@ struct MainWindow: View {
 }
 
 private struct DetailPlaceholder: View {
-    let state: ViewerState
+    @Bindable var state: ViewerState
 
     var body: some View {
         Group {
@@ -59,34 +59,42 @@ private struct DetailPlaceholder: View {
 
     @ViewBuilder
     private func loadedView(document: WaveformDocument) -> some View {
-        if let selectedID = state.selectedSignalID,
-           let signal = document.signal(withID: selectedID) {
-            VStack(spacing: 0) {
-                tracesHeader(document: document, signal: signal)
-                Divider()
-                PlotView(document: document, visibleSignalIDs: [selectedID])
-                    // Tying view identity to the source URL forces SwiftUI to rebuild
-                    // the PlotView (and its PlotNSView) whenever the underlying file
-                    // changes, which resets the zoom/pan viewport. Signal-only changes
-                    // within the same document preserve identity, so the viewport
-                    // state survives those as intended.
-                    .id(document.sourceURL)
-            }
+        if state.visibleSignalIDs.isEmpty {
+            noTracesSelected(document: document)
         } else {
-            unselectedSignalState(document: document)
+            VStack(spacing: 0) {
+                traceLegend(document: document)
+                Divider()
+                PlotView(
+                    document: document,
+                    visibleSignalIDs: state.visibleSignalIDs,
+                    viewport: state.viewportX,
+                    onViewportChange: { state.viewportX = $0 }
+                )
+                // Rebuild the plot from scratch when the source file changes so
+                // the viewport and decimation cache fully reset.
+                .id(document.sourceURL)
+            }
         }
     }
 
     @ViewBuilder
-    private func tracesHeader(document: WaveformDocument, signal: Signal) -> some View {
-        HStack(spacing: 12) {
-            Circle()
-                .fill(.tint)
-                .frame(width: 10, height: 10)
-            Text(signal.displayName)
-                .font(.headline)
-            Text("(\(signal.unit))")
-                .foregroundStyle(.secondary)
+    private func traceLegend(document: WaveformDocument) -> some View {
+        HStack(spacing: 14) {
+            ForEach(state.visibleSignalIDs, id: \.self) { signalID in
+                if let signal = document.signal(withID: signalID) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(Color(nsColor: ColorPalette.stableColor(for: signalID)))
+                            .frame(width: 10, height: 10)
+                        Text(signal.displayName)
+                            .font(.caption)
+                        Text("(\(signal.unit))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
             Spacer()
             Text("\(document.sampleCount) samples")
                 .font(.caption)
@@ -97,7 +105,7 @@ private struct DetailPlaceholder: View {
     }
 
     @ViewBuilder
-    private func unselectedSignalState(document: WaveformDocument) -> some View {
+    private func noTracesSelected(document: WaveformDocument) -> some View {
         VStack(spacing: 12) {
             Image(systemName: "waveform")
                 .font(.system(size: 48, weight: .light))
@@ -111,7 +119,7 @@ private struct DetailPlaceholder: View {
             }
             .font(.callout)
             .foregroundStyle(.secondary)
-            Text("Click a signal in the sidebar to plot it")
+            Text("Check signals in the sidebar to plot them, or use View → Show All Signals.")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
                 .padding(.top, 12)

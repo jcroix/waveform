@@ -25,12 +25,15 @@ final class PlotNSView: NSView {
 
     // MARK: - Viewport
 
-    /// Visible time range. `nil` means "show the full signal span" — the same behavior
-    /// Phases 6 and 7 had. Pinch and scroll-pan mutate this in place; double-click and
-    /// ⌘0 reset it to `nil`. Viewport survives signal-only changes within the same
-    /// document but resets on document changes so a newly-opened file always starts
-    /// zoomed out.
+    /// Visible time range supplied by the owning `ViewerState`. `nil` means "show the
+    /// full sample span". Gestures report proposed viewport changes back to the owner
+    /// via `onViewportChange`; the owner then flows the new value back in via
+    /// `setContent`. PlotNSView does not own this state.
     private var viewportX: ClosedRange<Double>?
+
+    /// Callback fired when a gesture-driven viewport change is produced. Bound to
+    /// `state.viewportX = newValue` by the SwiftUI wrapper.
+    var onViewportChange: ((ClosedRange<Double>?) -> Void)?
 
     /// Snapshot of viewport at the start of a pinch. The gesture accumulates a
     /// magnification delta from zero, so we need the starting viewport to compute
@@ -190,14 +193,18 @@ final class PlotNSView: NSView {
 
     // MARK: - Public API
 
-    func setContent(document: WaveformDocument?, visibleSignalIDs: [SignalID]) {
+    func setContent(
+        document: WaveformDocument?,
+        visibleSignalIDs: [SignalID],
+        viewport: ClosedRange<Double>?
+    ) {
         let sourceChanged = self.document?.sourceURL != document?.sourceURL
         self.document = document
         self.visibleSignalIDs = visibleSignalIDs
+        self.viewportX = viewport
         if sourceChanged {
-            // New document → fresh full-range viewport and a purged decimation cache
-            // (signal IDs from the old document are meaningless in the new one).
-            viewportX = nil
+            // New document → stale SignalIDs from the old one are meaningless and any
+            // cached decimated traces with those IDs must go.
             decimationCache.removeAll()
         }
         rebuildIfNeeded()
@@ -246,15 +253,14 @@ final class PlotNSView: NSView {
         return tStart...tEnd
     }
 
-    /// Reset to full range. Invoked by ⌘0 and double-click.
+    /// Reset to full range by notifying the owner. The owner flows the `nil` back in
+    /// through `setContent` on the next SwiftUI render.
     private func resetViewport() {
-        guard viewportX != nil else { return }
-        viewportX = nil
-        rebuildIfNeeded()
+        onViewportChange?(nil)
     }
 
-    /// Apply a new visible range, clamped to the full span, and trigger a rebuild if
-    /// anything actually changed.
+    /// Propose a new visible range to the owner, clamped to the full span. The new
+    /// value arrives back via `setContent` after SwiftUI re-evaluates.
     private func applyViewport(_ proposed: ClosedRange<Double>) {
         guard let full = fullSpan(), proposed.lowerBound < proposed.upperBound else {
             return
@@ -283,8 +289,15 @@ final class PlotNSView: NSView {
         if clamped == viewportX {
             return
         }
-        viewportX = clamped
-        rebuildIfNeeded()
+        // If the clamped range covers the full span, report `nil` so the owner can
+        // remain in "full range" mode rather than pinning the viewport to an exact
+        // copy of the span (nil is the canonical full-range representation).
+        if abs(clamped.lowerBound - full.lowerBound) < 1e-18 &&
+           abs(clamped.upperBound - full.upperBound) < 1e-18 {
+            onViewportChange?(nil)
+        } else {
+            onViewportChange?(clamped)
+        }
     }
 
     // MARK: - Gestures
@@ -499,12 +512,9 @@ final class PlotNSView: NSView {
         let pixelWidth = max(1, Int(width.rounded(.up)))
         let viewport: ClosedRange<Double> = geometry.tMin...geometry.tMax
 
-        // Single-trace case: use the kind-based default color so the plot matches the
-        // sidebar icon (voltage = yellow, current = blue, …). Multi-trace layouts will
-        // be revisited in Phase 9 when traces are added by drag-drop with persistent
-        // per-trace colors.
-        let useKindColor = (signals.count == 1)
-
+        // Each signal gets a stable palette color keyed off its SignalID, so the
+        // plot trace color always matches the sidebar icon tint for that signal
+        // regardless of how many other traces happen to be visible at the same time.
         for (traceIndex, signal) in signals.enumerated() {
             let shape = traceLayers[traceIndex]
             guard signal.values.count > 1 else {
@@ -528,9 +538,7 @@ final class PlotNSView: NSView {
 
             shape.frame = traceContainer.bounds
             shape.path = path
-            shape.strokeColor = (useKindColor
-                ? ColorPalette.color(for: signal.kind)
-                : ColorPalette.color(forTraceIndex: traceIndex)).cgColor
+            shape.strokeColor = ColorPalette.stableColor(for: signal.id).cgColor
             shape.rasterizationScale = rasterScale
         }
     }

@@ -24,6 +24,31 @@ struct WaveformViewerApp: App {
                 }
                 .keyboardShortcut("o", modifiers: .command)
             }
+            // Append to the built-in View menu instead of creating a second one. The
+            // .sidebar command group (sidebar show/hide) lives in the default View menu,
+            // so `after: .sidebar` slots our items in right after it.
+            CommandGroup(after: .sidebar) {
+                Divider()
+                Button("Zoom to Fit") {
+                    state.resetViewport()
+                }
+                .keyboardShortcut("0", modifiers: .command)
+                .disabled(state.document == nil)
+
+                Divider()
+
+                Button("Show All Signals") {
+                    state.showAllSignals()
+                }
+                .keyboardShortcut("a", modifiers: [.command, .shift])
+                .disabled(state.document == nil)
+
+                Button("Hide All Signals") {
+                    state.hideAllSignals()
+                }
+                .keyboardShortcut("h", modifiers: [.command, .shift])
+                .disabled(state.document == nil || state.visibleSignalIDs.isEmpty)
+            }
         }
     }
 }

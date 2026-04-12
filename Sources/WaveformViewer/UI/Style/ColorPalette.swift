@@ -23,10 +23,18 @@ enum ColorPalette {
         trace[(index % trace.count + trace.count) % trace.count]
     }
 
-    /// Default color for a single trace based on its signal kind. Matches the sidebar
-    /// icon tint so a signal keeps the same color when moving between the browser and
-    /// the plot. Multi-trace layouts (Phase 9+) will prefer the palette-index path since
-    /// collisions are common when several signals of the same kind are overlaid.
+    /// Stable per-signal color keyed off `SignalID`. Each signal in a document keeps
+    /// the same color regardless of visibility toggles so the sidebar icon and the
+    /// plot trace always agree. Collisions are inevitable past the palette length
+    /// (currently 12); a future Phase 9.5 will let users override via a context menu.
+    static func stableColor(for signalID: SignalID) -> NSColor {
+        color(forTraceIndex: signalID)
+    }
+
+    /// Default color for a trace based on its signal kind — used only for single-trace
+    /// rendering in Phase 6/8 contexts where there's no multi-trace palette to consult.
+    /// Phase 9.0+ uses `stableColor(for:)` for both the sidebar icon tint and the plot
+    /// trace color.
     static func color(for kind: SignalKind) -> NSColor {
         switch kind {
         case .voltage:      return .systemYellow

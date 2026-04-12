@@ -39,7 +39,12 @@ struct SignalSidebar: View {
             SignalOutlineView(
                 document: document,
                 filterText: state.filterText,
-                selectedSignalID: $state.selectedSignalID
+                // Reading `state.visibleSignalIDs` here subscribes this view to the
+                // property through the Observation framework. Without that access,
+                // menu commands (Show All / Hide All) that mutate visibleSignalIDs
+                // would never cause the sidebar to re-render and refresh checkboxes.
+                visibleSignalIDs: state.visibleSignalIDs,
+                state: state
             )
         } else {
             VStack(spacing: 8) {
