@@ -110,9 +110,26 @@ private func uniformlySampled(count: Int, generator: (Int) -> Float) -> (times: 
     }
 }
 
-@Test func sparseSignalProducesSparseBuckets() {
-    // 10 points spread across a viewport that maps to 1000 pixels — at most 10 buckets
-    // should be populated.
+@Test func sparseSignalPureDecimationProducesSparseBuckets() {
+    // 10 points spread across a viewport that maps to 1000 pixels — with
+    // fillInterpolatedGaps OFF, at most 10 buckets should be populated.
+    let (times, values) = uniformlySampled(count: 10) { i in Float(i) }
+    let decimated = Decimator.decimate(
+        timeValues: times,
+        values: values,
+        viewport: 0...9,
+        pixelWidth: 1000,
+        fillInterpolatedGaps: false
+    )
+    let populated = decimated.buckets.filter(\.isPopulated).count
+    #expect(populated <= 10)
+    #expect(populated >= 1)
+}
+
+@Test func sparseSignalFillsGapsBetweenPopulatedBuckets() {
+    // Same 10 sparse points but with the default fill behavior — everything
+    // BETWEEN the first and last populated columns should be filled in with
+    // interpolated values, so hit-testing finds a bucket at every drawn pixel.
     let (times, values) = uniformlySampled(count: 10) { i in Float(i) }
     let decimated = Decimator.decimate(
         timeValues: times,
@@ -120,9 +137,41 @@ private func uniformlySampled(count: Int, generator: (Int) -> Float) -> (times: 
         viewport: 0...9,
         pixelWidth: 1000
     )
-    let populated = decimated.buckets.filter(\.isPopulated).count
-    #expect(populated <= 10)
-    #expect(populated >= 1)
+
+    // Identify the first and last originally-populated columns. Everything
+    // between them should now be populated.
+    let populatedIndices = decimated.buckets.enumerated()
+        .filter({ $0.element.isPopulated })
+        .map(\.offset)
+    #expect(populatedIndices.count > 100)
+
+    let firstCol = populatedIndices.first!
+    let lastCol = populatedIndices.last!
+    for col in firstCol...lastCol {
+        #expect(decimated.buckets[col].isPopulated,
+                "column \(col) should be populated after fill")
+    }
+}
+
+@Test func fillInterpolatesLinearlyBetweenSparseSamples() {
+    // Two samples one at value 0 and one at value 10, ten pixel columns apart.
+    // Fill should produce nine interpolated bucket values on a linear ramp.
+    let decimated = Decimator.decimate(
+        timeValues: [0.0, 10.0],
+        values: [Float(0.0), Float(10.0)],
+        viewport: 0...10,
+        pixelWidth: 11
+    )
+
+    // Sanity: cols 0 and 10 are the original samples; cols 1..9 are filled.
+    // Each filled bucket should match the linear interpolation v = fraction * 10.
+    for col in 1...9 {
+        let expected = Float(col) * 10.0 / 10.0
+        let bucket = decimated.buckets[col]
+        #expect(bucket.isPopulated)
+        #expect(abs(bucket.minValue - expected) < 1e-4)
+        #expect(bucket.minValue == bucket.maxValue)
+    }
 }
 
 @Test func degenerateViewportReturnsEmptyBuckets() {

@@ -35,13 +35,22 @@ public enum Decimator {
     /// non-decreasing, and aligned 1:1 with `values`. Samples outside the viewport are
     /// skipped.
     ///
-    /// Complexity: O(number of samples in the viewport) — binary-searches the boundaries
-    /// so zoomed-in views don't pay for samples outside the visible window.
+    /// When `fillInterpolatedGaps` is true (the default — what the plot panel uses),
+    /// empty buckets that sit between two populated ones are filled in with linearly-
+    /// interpolated values. This does not change the rendered polyline's appearance
+    /// (the drawn line is the same straight segment either way) but it's essential for
+    /// **hit testing**: without filled buckets, a click in the middle of a PWL
+    /// transition between sparse samples (e.g., a zoomed-in view of a clock edge)
+    /// finds no populated columns within the hit radius and fails to select the
+    /// trace. Callers that want pure decimation semantics (unit tests) pass `false`.
+    ///
+    /// Complexity: O(samples in the viewport + pixel width).
     public static func decimate(
         timeValues: [Double],
         values: [Float],
         viewport: ClosedRange<Double>,
-        pixelWidth: Int
+        pixelWidth: Int,
+        fillInterpolatedGaps: Bool = true
     ) -> DecimatedTrace {
         precondition(pixelWidth > 0, "pixelWidth must be positive")
         precondition(
@@ -60,7 +69,7 @@ public enum Decimator {
 
         // Binary-search the slice of timeValues that lies within the viewport. This
         // keeps decimation cost proportional to the visible sample count rather than
-        // the full trace length, which matters when Phase 8 pan/zoom lands.
+        // the full trace length.
         let startIndex = lowerBound(timeValues, target: tMin)
         let endIndex = upperBoundInclusive(timeValues, target: tMax)
         guard startIndex < endIndex else {
@@ -97,7 +106,60 @@ public enum Decimator {
             }
         }
 
+        if fillInterpolatedGaps {
+            fillGaps(in: &buckets)
+        }
+
         return DecimatedTrace(pixelWidth: pixelWidth, buckets: buckets)
+    }
+
+    /// Walks the bucket array and fills empty columns that sit between two populated
+    /// ones with a linearly-interpolated single value, keyed off each populated
+    /// neighbor's midpoint. The resulting rendered polyline is visually identical to
+    /// the pre-fill version (same straight line), but the filled buckets give hit
+    /// testing real data to find at every pixel along the segment.
+    private static func fillGaps(in buckets: inout [DecimationBucket]) {
+        let width = buckets.count
+        guard width > 1 else { return }
+
+        var lastPopulated: Int = -1
+        for col in 0..<width where buckets[col].isPopulated {
+            lastPopulated = col
+            break
+        }
+        guard lastPopulated >= 0 else { return }
+
+        var nextSearchStart = lastPopulated + 1
+        while nextSearchStart < width {
+            var nextPopulated = -1
+            for col in nextSearchStart..<width where buckets[col].isPopulated {
+                nextPopulated = col
+                break
+            }
+            guard nextPopulated >= 0 else { break }
+
+            let gapStart = lastPopulated + 1
+            let gapEnd = nextPopulated
+            if gapEnd > gapStart {
+                let bucketA = buckets[lastPopulated]
+                let bucketB = buckets[nextPopulated]
+                let valueA = (bucketA.minValue + bucketA.maxValue) / 2
+                let valueB = (bucketB.minValue + bucketB.maxValue) / 2
+                let span = Float(nextPopulated - lastPopulated)
+                for col in gapStart..<gapEnd {
+                    let fraction = Float(col - lastPopulated) / span
+                    let v = valueA + fraction * (valueB - valueA)
+                    buckets[col] = DecimationBucket(
+                        minValue: v,
+                        maxValue: v,
+                        isPopulated: true
+                    )
+                }
+            }
+
+            lastPopulated = nextPopulated
+            nextSearchStart = nextPopulated + 1
+        }
     }
 
     // MARK: - Binary search helpers
