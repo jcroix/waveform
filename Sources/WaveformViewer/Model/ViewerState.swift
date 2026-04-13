@@ -39,6 +39,13 @@ public final class ViewerState {
     /// underlying viewport.
     public var viewportX: ClosedRange<Double>?
 
+    /// Per-unit Y viewport overrides, keyed by the signal unit string (`"V"`, `"A"`,
+    /// `"W"`, …). Missing key = auto-scale to the full data range (the Phase 13
+    /// default behavior). Present key = lock the Y axis of every plot rendering that
+    /// unit to the given range. ⌥-pinch and vertical scroll gestures mutate this
+    /// map; ⌘0 and double-click clear it entirely.
+    public var viewportsY: [String: ClosedRange<Double>] = [:]
+
     // MARK: - Cursor
 
     /// X-axis position of the single cursor, in simulation-time units. `nil` means
@@ -55,6 +62,10 @@ public final class ViewerState {
     /// separate pane.
     public var plotLayout: PlotLayout = .stackedStrips
 
+    /// Whether the plot draws gridlines at the axis-tick positions. Defaults to
+    /// `true`; toggled via View → Show Grid.
+    public var showGrid: Bool = true
+
     public init() {}
 
     // MARK: - Document open
@@ -69,6 +80,7 @@ public final class ViewerState {
             visibleSignalIDs = []
             focusedSignalID = nil
             viewportX = nil
+            viewportsY = [:]
             cursorTimeX = nil
             filterText = ""
         } catch {
@@ -77,6 +89,7 @@ public final class ViewerState {
             visibleSignalIDs = []
             focusedSignalID = nil
             viewportX = nil
+            viewportsY = [:]
             cursorTimeX = nil
         }
     }
@@ -157,9 +170,192 @@ public final class ViewerState {
 
     // MARK: - Viewport commands
 
-    /// Reset the X-axis viewport to the full sample span.
+    /// Reset both the X-axis viewport and every Y-axis override to "auto-scale"
+    /// behavior. Called by ⌘0 and double-click.
     public func resetViewport() {
         viewportX = nil
+        viewportsY = [:]
+    }
+
+    /// Reset the X viewport only.
+    public func resetXViewport() {
+        viewportX = nil
+    }
+
+    /// Remove every per-unit Y viewport override, letting each unit auto-scale to its
+    /// full data range again.
+    public func resetYViewport() {
+        viewportsY = [:]
+    }
+
+    // MARK: - Fixed-level zooms
+
+    /// Zoom the X axis around the cursor (or viewport midpoint if no cursor is
+    /// placed) by `factor`. `factor > 1` zooms IN (shrinks span); `factor < 1` zooms
+    /// OUT. Clamped to the simulation's full time span.
+    public func zoomX(by factor: Double) {
+        guard factor > 0,
+              let document = document,
+              let fullStart = document.timeValues.first,
+              let fullEnd = document.timeValues.last,
+              fullEnd > fullStart else { return }
+
+        let full = fullStart...fullEnd
+        let current = viewportX ?? full
+        let anchor: Double
+        if let cursor = cursorTimeX, cursor >= current.lowerBound, cursor <= current.upperBound {
+            anchor = cursor
+        } else {
+            anchor = (current.lowerBound + current.upperBound) / 2
+        }
+        let currentSpan = current.upperBound - current.lowerBound
+        let newSpan = currentSpan / factor
+
+        let anchorFraction = (anchor - current.lowerBound) / currentSpan
+        var newLower = anchor - anchorFraction * newSpan
+        var newUpper = anchor + (1 - anchorFraction) * newSpan
+
+        if newLower < full.lowerBound {
+            let shift = full.lowerBound - newLower
+            newLower += shift
+            newUpper += shift
+        }
+        if newUpper > full.upperBound {
+            let shift = newUpper - full.upperBound
+            newLower -= shift
+            newUpper -= shift
+        }
+        newLower = max(newLower, full.lowerBound)
+        newUpper = min(newUpper, full.upperBound)
+        guard newLower < newUpper else { return }
+
+        if abs(newLower - full.lowerBound) < 1e-18 && abs(newUpper - full.upperBound) < 1e-18 {
+            viewportX = nil
+        } else {
+            viewportX = newLower...newUpper
+        }
+    }
+
+    /// Set the X viewport span to `fullSpan / absolute` centered on the cursor (or
+    /// midpoint) at the current zoom level. `absolute = 1` is the full range.
+    public func setZoomX(absolute: Double) {
+        guard absolute >= 1,
+              let document = document,
+              let fullStart = document.timeValues.first,
+              let fullEnd = document.timeValues.last,
+              fullEnd > fullStart else { return }
+
+        let fullSpan = fullEnd - fullStart
+        let newSpan = fullSpan / absolute
+        let anchor: Double
+        if let cursor = cursorTimeX {
+            anchor = cursor
+        } else if let existing = viewportX {
+            anchor = (existing.lowerBound + existing.upperBound) / 2
+        } else {
+            anchor = (fullStart + fullEnd) / 2
+        }
+
+        var newLower = anchor - newSpan / 2
+        var newUpper = newLower + newSpan
+        if newLower < fullStart {
+            newLower = fullStart
+            newUpper = newLower + newSpan
+        }
+        if newUpper > fullEnd {
+            newUpper = fullEnd
+            newLower = max(fullStart, newUpper - newSpan)
+        }
+        if newLower == fullStart && newUpper == fullEnd {
+            viewportX = nil
+        } else {
+            viewportX = newLower...newUpper
+        }
+    }
+
+    /// Zoom every Y axis by `factor` around each axis's midpoint. `factor > 1` zooms
+    /// IN; `factor < 1` zooms OUT. Each unit's current effective range (either an
+    /// override or the auto-scaled full range computed from the signals) is taken
+    /// as the starting point. The result is stored as an override in `viewportsY`.
+    public func zoomY(by factor: Double) {
+        guard factor > 0, let document = document else { return }
+
+        for unit in uniqueVisibleUnits() {
+            let current = effectiveYRange(for: unit, document: document) ?? fullYRange(for: unit, document: document)
+            guard let current = current else { continue }
+            let mid = (current.lowerBound + current.upperBound) / 2
+            let span = current.upperBound - current.lowerBound
+            let newSpan = span / factor
+            viewportsY[unit] = (mid - newSpan / 2)...(mid + newSpan / 2)
+        }
+    }
+
+    /// Set every Y axis's span to `(full range of that unit) / absolute`, centered on
+    /// each unit's full-range midpoint.
+    public func setZoomY(absolute: Double) {
+        guard absolute >= 1, let document = document else { return }
+        for unit in uniqueVisibleUnits() {
+            guard let full = fullYRange(for: unit, document: document) else { continue }
+            let span = full.upperBound - full.lowerBound
+            let newSpan = span / absolute
+            let mid = (full.lowerBound + full.upperBound) / 2
+            if absolute <= 1.0 + 1e-9 {
+                viewportsY.removeValue(forKey: unit)
+            } else {
+                viewportsY[unit] = (mid - newSpan / 2)...(mid + newSpan / 2)
+            }
+        }
+    }
+
+    // MARK: Y-viewport helpers (internal)
+
+    /// Returns the set of unique signal units represented in `visibleSignalIDs`. The
+    /// fixed-level Y zoom commands apply to every unique unit so stacked strips and
+    /// dual-axis panes both get zoomed in one action.
+    private func uniqueVisibleUnits() -> [String] {
+        guard let document = document else { return [] }
+        var seen: Set<String> = []
+        var result: [String] = []
+        for id in visibleSignalIDs {
+            guard let signal = document.signal(withID: id) else { continue }
+            if !seen.contains(signal.unit) {
+                seen.insert(signal.unit)
+                result.append(signal.unit)
+            }
+        }
+        return result
+    }
+
+    private func effectiveYRange(for unit: String, document: WaveformDocument) -> ClosedRange<Double>? {
+        if let override = viewportsY[unit] { return override }
+        return fullYRange(for: unit, document: document)
+    }
+
+    private func fullYRange(for unit: String, document: WaveformDocument) -> ClosedRange<Double>? {
+        var yMin = Float.greatestFiniteMagnitude
+        var yMax = -Float.greatestFiniteMagnitude
+        var seen = false
+        for signal in document.signals where signal.unit == unit && visibleSignalIDs.contains(signal.id) {
+            for v in signal.values {
+                if v < yMin { yMin = v }
+                if v > yMax { yMax = v }
+                seen = true
+            }
+        }
+        guard seen, yMin.isFinite, yMax.isFinite else { return nil }
+
+        var lo = Double(yMin)
+        var hi = Double(yMax)
+        if lo == hi {
+            let fallback = lo == 0 ? 1.0 : abs(lo) * 0.1
+            lo -= fallback
+            hi += fallback
+        } else {
+            let pad = (hi - lo) * 0.05
+            lo -= pad
+            hi += pad
+        }
+        return lo...hi
     }
 
     // MARK: - Cursor commands

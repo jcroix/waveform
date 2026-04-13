@@ -122,6 +122,48 @@ private struct ViewCommands: View {
 
         Divider()
 
+        Menu("Horizontal Zoom") {
+            Button("Zoom In") { state?.zoomX(by: 2) }
+                .keyboardShortcut("=", modifiers: .command)
+            Button("Zoom Out") { state?.zoomX(by: 0.5) }
+                .keyboardShortcut("-", modifiers: .command)
+            Divider()
+            Button("2×") { state?.setZoomX(absolute: 2) }
+            Button("4×") { state?.setZoomX(absolute: 4) }
+            Button("8×") { state?.setZoomX(absolute: 8) }
+            Button("16×") { state?.setZoomX(absolute: 16) }
+            Divider()
+            Button("Full Range") { state?.resetXViewport() }
+        }
+        .disabled(state?.document == nil)
+
+        Menu("Vertical Zoom") {
+            Button("Zoom In") { state?.zoomY(by: 2) }
+                .keyboardShortcut("=", modifiers: [.command, .shift])
+            Button("Zoom Out") { state?.zoomY(by: 0.5) }
+                .keyboardShortcut("-", modifiers: [.command, .shift])
+            Divider()
+            Button("2×") { state?.setZoomY(absolute: 2) }
+            Button("4×") { state?.setZoomY(absolute: 4) }
+            Button("8×") { state?.setZoomY(absolute: 8) }
+            Button("16×") { state?.setZoomY(absolute: 16) }
+            Divider()
+            Button("Full Range") { state?.resetYViewport() }
+        }
+        .disabled(state?.document == nil)
+
+        Divider()
+
+        Toggle(isOn: Binding(
+            get: { state?.showGrid ?? true },
+            set: { state?.showGrid = $0 }
+        )) {
+            Text("Show Grid")
+        }
+        .disabled(state == nil)
+
+        Divider()
+
         Button("Go to Time…") {
             state?.presentGoToTimeDialog()
         }

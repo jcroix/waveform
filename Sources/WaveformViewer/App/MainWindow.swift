@@ -120,9 +120,19 @@ private struct DetailPlaceholder: View {
                             primaryUnit: group.unit
                         ),
                         viewport: state.viewportX,
+                        viewportsY: state.viewportsY,
                         focusedSignalID: state.focusedSignalID,
                         cursorTimeX: state.cursorTimeX,
+                        showGrid: state.showGrid,
                         onViewportChange: { state.viewportX = $0 },
+                        onYViewportChange: { unit, range in
+                            if let range = range {
+                                state.viewportsY[unit] = range
+                            } else {
+                                state.viewportsY.removeValue(forKey: unit)
+                            }
+                        },
+                        onResetAll: { state.resetViewport() },
                         onFocusChange: { state.focusedSignalID = $0 },
                         onCursorChange: { state.cursorTimeX = $0 }
                     )
@@ -144,9 +154,19 @@ private struct DetailPlaceholder: View {
                 document: document,
                 assignment: dualAxisAssignment(groups: groups),
                 viewport: state.viewportX,
+                viewportsY: state.viewportsY,
                 focusedSignalID: state.focusedSignalID,
                 cursorTimeX: state.cursorTimeX,
+                showGrid: state.showGrid,
                 onViewportChange: { state.viewportX = $0 },
+                onYViewportChange: { unit, range in
+                    if let range = range {
+                        state.viewportsY[unit] = range
+                    } else {
+                        state.viewportsY.removeValue(forKey: unit)
+                    }
+                },
+                onResetAll: { state.resetViewport() },
                 onFocusChange: { state.focusedSignalID = $0 },
                 onCursorChange: { state.cursorTimeX = $0 }
             )
