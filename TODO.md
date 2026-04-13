@@ -64,10 +64,41 @@ Implementation notes:
 
 ## Other follow-ups noted during development
 
-- **Nascentric TR0 big-endian fix**: the viewer's byte-order auto-detect
-  already handles both orders, but OmegaSim's `wTrZeroWriter.cpp` should
-  be updated to write spec-compliant big-endian TR0. Separate work
-  against nascentric; the viewer doesn't care which format is written.
+- **OmegaSim's TR0 is a Nascentric dialect, not standard HSPICE 9601.**
+  Cross-checked against the HMC-ACE hspiceParser documentation
+  (`HMC-ACE/hspiceParser/hSpice_output.md`). The doc describes a
+  variable-width header with an asterisk separator between the
+  version descriptor and the filename, then whitespace-separated
+  date / time / copyright / sweep count / variable names. OmegaSim's
+  `wTrZeroWriter.cpp` instead writes fixed-width, space-padded
+  fields with no asterisk, and uses bytes 4–15 of the descriptor as
+  structured `probeCount` / `sweepCount` / reserved ASCII ints (where
+  the doc says "reserved, 16 digits"). Waveform identifiers are also
+  packed as 8-byte slots (`"  1     "` = V, `"  8     "` = I) rather
+  than whitespace-separated numbers. My parser was reverse-engineered
+  from the Nascentric reader so it decodes OmegaSim output correctly,
+  but it would choke on a real HSPICE-produced `.tr0`. Follow-ups:
+    - **Nascentric side**: update `wTrZeroWriter.cpp` to emit
+      spec-compliant 9601 so third-party viewers (GTKWave, gaw, etc.)
+      can open OmegaSim output too.
+    - **Viewer side**: once there are two dialects in the wild, add a
+      header-signature sniff and a second parse path that handles the
+      asterisk-separated layout. The viewer should transparently
+      support both.
+- **AArch64 vs x86-64 byte-compare**: `wTrZeroWriter.cpp` uses plain
+  `fwrite(&value, 4, 1, fp)` on `int` and `float` locals — no
+  platform-specific code. Both x86-64 and AArch64 are little-endian,
+  IEEE-754, and have 32-bit `int`/`float`, so OmegaSim output should
+  be byte-identical on both machines for the same netlist. If a
+  diff shows up in anything other than the date/time fields, that's
+  a real bug worth investigating: likely uninitialized padding,
+  heap-derived data, or a non-deterministic timestamp.
+- **Nascentric TR0 big-endian fix**: independent of the dialect
+  question, OmegaSim's current writer produces native-endian output.
+  The HSPICE canonical format allows either endianness (the block
+  head encodes which), but real HSPICE tools historically emit
+  big-endian. The viewer's byte-order auto-detect already handles
+  both, so this is a nascentric-side cosmetic fix only.
 - **Multi-table `.out` files**: flagged early but deferred. If OmegaSim
   starts emitting wide `.print` output as multiple column-split `x`/`y`
   blocks, `ListingParser` will currently emit each as an independent
