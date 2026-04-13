@@ -20,17 +20,26 @@ cursors, `.fsdb`, and VCD.
 - macOS 14.0 (Sonoma) or later
 - Swift 6.0 toolchain (ships with Xcode 16)
 
-## Build
+## Build and run
 
 ```sh
-swift build
-swift test
-swift run WaveformViewer
+swift build                            # compile
+swift test                             # run all tests
+./scripts/make-app.sh                  # build a .app bundle (debug)
+./scripts/make-app.sh release          # or a release bundle
+open .build/debug/WaveformViewer.app   # launch
 ```
 
-A proper `.app` bundle with code signing and notarization will be produced via
-an Xcode project added later; for now the package runs directly from the
-command line.
+**Always launch via the `.app` bundle, not `swift run`.** `swift run` technically
+works but on macOS 14+ it launches an un-bundled Mach-O with no `Info.plist`,
+which puts the process into degraded windowing (no dock icon, `NSOpenPanel`
+loses focus on click, elevated WindowServer CPU). `scripts/make-app.sh` wraps
+the compiled binary in a minimal `.app` with the keys macOS actually wants
+(`NSHighResolutionCapable`, `NSPrincipalClass`, `CFBundleIdentifier`,
+`NSSupportsAutomaticGraphicsSwitching`).
+
+A code-signed and notarized bundle for distribution will come later via an
+Xcode project; the script above is sufficient for local use.
 
 ## Supported input formats
 

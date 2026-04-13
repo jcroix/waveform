@@ -51,15 +51,19 @@ public struct WaveformDocument: Sendable {
 
 extension WaveformDocument {
     public static func load(from url: URL) throws -> WaveformDocument {
-        let ext = url.pathExtension.lowercased()
-        switch ext {
-        case "tr0":
-            return try loadTR0(url: url)
-        case "out":
+        // Dispatch on filename. `URL.pathExtension` only returns the segment
+        // after the LAST dot, which is wrong for files like `test1.tr0.binary`
+        // or `tlong.tr0.9601` where the format marker is mid-name. Look at the
+        // full lowercased filename and pick the parser that matches.
+        let name = url.lastPathComponent.lowercased()
+        if name.hasSuffix(".out") {
             return try loadListing(url: url)
-        default:
-            throw ParseError.invalidHeader(reason: "unsupported file extension: '\(ext)'")
         }
+        if name.hasSuffix(".tr0") || name.contains(".tr0.") {
+            return try loadTR0(url: url)
+        }
+        let ext = url.pathExtension.lowercased()
+        throw ParseError.invalidHeader(reason: "unsupported file extension: '\(ext)'")
     }
 
     public static func loadTR0(url: URL) throws -> WaveformDocument {

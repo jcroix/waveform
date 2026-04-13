@@ -77,14 +77,105 @@ Implementation notes:
   packed as 8-byte slots (`"  1     "` = V, `"  8     "` = I) rather
   than whitespace-separated numbers. My parser was reverse-engineered
   from the Nascentric reader so it decodes OmegaSim output correctly,
-  but it would choke on a real HSPICE-produced `.tr0`. Follow-ups:
-    - **Nascentric side**: update `wTrZeroWriter.cpp` to emit
-      spec-compliant 9601 so third-party viewers (GTKWave, gaw, etc.)
-      can open OmegaSim output too.
-    - **Viewer side**: once there are two dialects in the wild, add a
-      header-signature sniff and a second parse path that handles the
-      asterisk-separated layout. The viewer should transparently
-      support both.
+  but it would choke on a real HSPICE-produced `.tr0`.
+
+  External references for TR0 format documentation and example files
+  (both contain sample `.tr0` files — if downloaded, keep in a
+  separate directory from the Nascentric fixtures since their
+  provenance is unknown):
+    - HMC-ACE hspiceParser: https://github.com/HMC-ACE/hspiceParser
+      (format doc at `hSpice_output.md`)
+    - l-chang/gwave: https://github.com/l-chang/gwave — a Gtk-based
+      waveform viewer. Parser: `spicefile/ss_hspice.c`. Format notes:
+      `doc/hspice-output.txt`.
+
+  **gwave vs Nascentric vs HMC-ACE — compared.** I read gwave's
+  `ss_hspice.c` and `doc/hspice-output.txt` and diffed against
+  Nascentric and the HMC-ACE doc. Findings:
+
+  1. **Fixed-byte count prefix at bytes 0–11.** gwave AGREES with
+     Nascentric — both treat bytes 0–3 as `nauto`, 4–7 as `nprobe`,
+     8–11 as `nsweepparam`, as 4-digit space-padded ASCII ints.
+     gwave's `ss_hspice.c` does `strncpy(nbuf, &ahdr[0], 4); nauto =
+     atoi(nbuf);` etc. The HMC-ACE doc DISAGREES — it says this
+     region is "reserved 16 digits" after the version descriptor,
+     not a structured prefix. gwave and Nascentric are in the same
+     "fixed-offset count prefix" family; HMC-ACE is in its own
+     world.
+
+  2. **Version tag at bytes 16–19.** gwave AGREES with Nascentric —
+     both expect a 4-char ASCII version string there, and gwave
+     specifically checks for `"9007"` or `"9601"` via
+     `strncmp(&ahdr[16], "9601", 4) != 0`. Nascentric writes exactly
+     `"9601"` at byte 16 (padded out to 8 bytes with spaces, which
+     gwave ignores). Compatible.
+
+  3. **Post-header data (date / time / copyright / sweep count /
+     types / names).** gwave and Nascentric DISAGREE on layout but
+     may still interoperate thanks to gwave's permissive parser:
+       - **Nascentric** writes strict fixed-width fields (64B title,
+         16B date, 8B time, 72B copyright, then 4B table count +
+         80B padding, then 8B waveform type slots, then 16B-aligned
+         name blocks).
+       - **gwave** doesn't care about fixed-width layout — from byte
+         ~256 onward it `strtok`s everything on whitespace and
+         consumes tokens in order: independent-var type, dependent
+         type codes, independent-var name, dependent names,
+         terminated by `$&%#`. Since Nascentric's fixed-width fields
+         are all space-padded ASCII and don't contain embedded NUL
+         bytes, gwave's tokenizer should, in theory, successfully
+         scan type codes (`"1"`, `"8"`) and names out of them. Not
+         yet verified on a real file.
+
+  4. **Binary block framing.** gwave AGREES with Nascentric on the
+     16-byte block header: `(h1=4, count, h3=4, block_nbytes)` plus
+     a 4-byte trailer equal to `block_nbytes`. gwave detects endian
+     swap by checking whether `h1 == 0x04000000` in the raw bytes
+     (which only happens on big-endian-on-little-endian), which is
+     the same strategy my parser uses. Fully compatible.
+
+  5. **Version years (9007 vs 9601).** gwave's doc explicitly says
+     `9007` is the July 1990 format and `9601` is the January 1996
+     format — the latter has been the default since HSPICE 98.2.
+     **Per the user's instruction we only care about 9601.** Both
+     Nascentric and my parser write and read 9601 only. gwave's
+     parser handles both but the 9007 path exists only for
+     backward-compatibility with ~25-year-old tool output.
+
+  6. **Endianness of real HSPICE files.** gwave's doc is candid: the
+     author didn't know whether real HSPICE files are big-endian or
+     native-endian and had no way to test. gwave handles both via
+     runtime sniff, same as my parser. So my auto-detect strategy
+     matches the one the other known TR0 reader uses.
+
+  **Bottom line:** gwave's interpretation is MUCH closer to
+  Nascentric's than HMC-ACE's is. gwave and Nascentric agree on the
+  fixed-byte count prefix, the version tag at byte 16, the binary
+  block framing, and endian detection. They disagree only on
+  whether the post-header region is fixed-width (Nascentric) or
+  whitespace-tokenized (gwave), and that disagreement is probably
+  benign because Nascentric's fixed-width bytes happen to tokenize
+  cleanly. HMC-ACE's "asterisk separator + variable-width" layout
+  is the outlier; it may describe a different HSPICE dialect
+  entirely, or it may be wrong.
+
+  Follow-ups:
+    - **Nascentric side**: the 9601 format we're writing today is
+      already broadly compatible with the gwave lineage. Biggest
+      practical issue is native-endian output — real HSPICE emitted
+      big-endian. A single-patch fix in `wTrZeroWriter.cpp` to swap
+      to big-endian would make OmegaSim output readable by any
+      reader that assumes canonical HSPICE byte order. (gwave and my
+      parser both auto-detect, so neither would care.)
+    - **Viewer side**: actually test my parser against a gwave
+      sample `.tr0` (when one is downloaded into a segregated
+      fixture directory) and confirm whether the 8-byte type-slot
+      vs. whitespace-token distinction matters. If it does, add a
+      second parse path; if not, we're already compatible.
+    - **HMC-ACE reconciliation**: lowest priority — if the HMC-ACE
+      doc is describing a third dialect, add a header sniff later.
+      Not worth doing until we actually see a real HMC-ACE-style
+      file in the wild.
 - **AArch64 vs x86-64 byte-compare**: `wTrZeroWriter.cpp` uses plain
   `fwrite(&value, 4, 1, fp)` on `int` and `float` locals — no
   platform-specific code. Both x86-64 and AArch64 are little-endian,
