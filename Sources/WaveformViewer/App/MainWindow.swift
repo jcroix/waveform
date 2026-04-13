@@ -119,12 +119,18 @@ private struct DetailPlaceholder: View {
                             primarySignalIDs: group.signalIDs,
                             primaryUnit: group.unit
                         ),
-                        viewport: state.viewportX,
+                        // Each stacked strip reads and writes its OWN unit's X
+                        // viewport entry. In linked mode these all collapse to
+                        // `sharedState.viewportX` via the state's routing logic;
+                        // in unlinked mode each strip is independent.
+                        viewport: state.xViewport(forUnit: group.unit),
                         viewportsY: state.viewportsY,
                         focusedSignalID: state.focusedSignalID,
                         cursorTimeX: state.cursorTimeX,
                         showGrid: state.showGrid,
-                        onViewportChange: { state.viewportX = $0 },
+                        onViewportChange: { [unit = group.unit] newValue in
+                            state.setXViewport(newValue, forUnit: unit)
+                        },
                         onYViewportChange: { unit, range in
                             if let range = range {
                                 state.viewportsY[unit] = range

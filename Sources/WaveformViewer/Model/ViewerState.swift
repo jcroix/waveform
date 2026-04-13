@@ -32,12 +32,65 @@ public final class ViewerState {
 
     // MARK: - Plot viewport
 
-    /// Visible time range on the X axis. `nil` means "full sample span". Pinch and
-    /// scroll-pan gestures mutate this in place; menu commands (View → Zoom to Fit)
-    /// and ⌘0 reset it to `nil`. Viewport is deliberately per-state, so cross-window
-    /// linked-zoom mode can share it later by pointing multiple windows at the same
-    /// underlying viewport.
-    public var viewportX: ClosedRange<Double>?
+    /// Per-window "unlinked" global X viewport. Used by the dual-axis plot pane
+    /// (which has only one X axis). Stacked-strips mode uses `localViewportsX`
+    /// instead so each strip can move independently when the user unlinks.
+    public var localViewportX: ClosedRange<Double>?
+
+    /// Per-unit "unlinked" X viewports. Each stacked strip keys off its unit
+    /// (`"V"`, `"A"`, `"W"`, …) and reads/writes its own entry here when linked
+    /// mode is off. Missing entry = fall back to `localViewportX` (full span).
+    ///
+    /// When linked mode is on, every strip and every window reads
+    /// `sharedState.viewportX` instead, so this map is inert. On a link →
+    /// unlink transition each visible unit's entry is seeded with the current
+    /// shared viewport so strips don't visibly jump.
+    public var localViewportsX: [String: ClosedRange<Double>] = [:]
+
+    /// "Global" X viewport accessor — used by dual-axis plots and menu commands
+    /// that don't have a specific unit in mind. Routes through shared state in
+    /// linked mode, local global in unlinked. Stacked strips should prefer
+    /// `xViewport(forUnit:)` / `setXViewport(_:forUnit:)` so each strip gets
+    /// independent control when the user unlinks.
+    public var viewportX: ClosedRange<Double>? {
+        get { xViewport(forUnit: nil) }
+        set { setXViewport(newValue, forUnit: nil) }
+    }
+
+    /// Reads the effective X viewport for a given unit. When linked, every unit
+    /// collapses to the shared viewport. When unlinked, each unit reads its own
+    /// entry from `localViewportsX` (falling back to the global local if the
+    /// per-unit entry is missing). Passing `nil` returns the global local — used
+    /// by the dual-axis pane, which has only one X axis.
+    public func xViewport(forUnit unit: String?) -> ClosedRange<Double>? {
+        if sharedState.linkedXZoom {
+            return sharedState.viewportX
+        }
+        if let unit = unit, let range = localViewportsX[unit] {
+            return range
+        }
+        return localViewportX
+    }
+
+    /// Writes the effective X viewport for a given unit. When linked, writes
+    /// go to the shared viewport regardless of unit. When unlinked, writes go
+    /// to the per-unit slot if a unit is supplied, or to the global local if
+    /// not.
+    public func setXViewport(_ range: ClosedRange<Double>?, forUnit unit: String?) {
+        if sharedState.linkedXZoom {
+            sharedState.viewportX = range
+            return
+        }
+        if let unit = unit {
+            if let range = range {
+                localViewportsX[unit] = range
+            } else {
+                localViewportsX.removeValue(forKey: unit)
+            }
+        } else {
+            localViewportX = range
+        }
+    }
 
     /// Per-unit Y viewport overrides, keyed by the signal unit string (`"V"`, `"A"`,
     /// `"W"`, …). Missing key = auto-scale to the full data range (the Phase 13
@@ -66,7 +119,63 @@ public final class ViewerState {
     /// `true`; toggled via View → Show Grid.
     public var showGrid: Bool = true
 
-    public init() {}
+    /// Reference to the app-level shared plot state. Must be supplied at
+    /// construction time so the computed `viewportX` can route reads and writes
+    /// correctly from the first frame.
+    public let sharedState: SharedPlotState
+
+    public init(sharedState: SharedPlotState) {
+        self.sharedState = sharedState
+    }
+
+    /// Forwarding accessor so menu commands can read/write the "linked" flag via
+    /// `@FocusedValue(\.activeViewerState)` without needing a second focused-value
+    /// key for `SharedPlotState`.
+    public var linkedXZoom: Bool {
+        get { sharedState.linkedXZoom }
+        set { setLinkedXZoom(newValue) }
+    }
+
+    /// Toggle the linked-X-zoom mode, handling the transition on both sides
+    /// cleanly. On unlink → link the frontmost window publishes its local
+    /// viewport to the shared state so the whole group converges to its view;
+    /// on link → unlink this window captures the current shared viewport as
+    /// its local so there's no visible jump. Other windows handle the
+    /// link → unlink capture via a `.onChange` hook in `MainWindowContainer`.
+    public func setLinkedXZoom(_ linked: Bool) {
+        let wasLinked = sharedState.linkedXZoom
+        if linked && !wasLinked {
+            // Unlinked → linked: push this window's local into shared so
+            // everyone else converges here.
+            sharedState.viewportX = localViewportX
+        }
+        sharedState.linkedXZoom = linked
+        if !linked {
+            // Linked → unlinked for this window: snapshot the shared value
+            // into the local field so our visible viewport stays put.
+            localViewportX = sharedState.viewportX
+        }
+    }
+
+    /// Called when the link flag flips from on to off, so every window and
+    /// every stacked strip captures the current shared viewport as its new
+    /// local starting point. Without this, a background window (or a strip
+    /// that hadn't previously been zoomed independently) would suddenly jump
+    /// to whatever stale value its locals held from an earlier unlinked
+    /// session.
+    public func captureSharedAsLocalViewport() {
+        let shared = sharedState.viewportX
+        localViewportX = shared
+        // Seed every visible unit's per-unit entry so stacked strips stay in
+        // place at the moment of unlinking.
+        for unit in uniqueVisibleUnits() {
+            if let shared = shared {
+                localViewportsX[unit] = shared
+            } else {
+                localViewportsX.removeValue(forKey: unit)
+            }
+        }
+    }
 
     // MARK: - Document open
 
@@ -79,7 +188,11 @@ public final class ViewerState {
             loadError = nil
             visibleSignalIDs = []
             focusedSignalID = nil
-            viewportX = nil
+            localViewportX = nil
+            localViewportsX = [:]
+            if sharedState.linkedXZoom {
+                sharedState.viewportX = nil
+            }
             viewportsY = [:]
             cursorTimeX = nil
             filterText = ""
@@ -88,7 +201,11 @@ public final class ViewerState {
             document = nil
             visibleSignalIDs = []
             focusedSignalID = nil
-            viewportX = nil
+            localViewportX = nil
+            localViewportsX = [:]
+            if sharedState.linkedXZoom {
+                sharedState.viewportX = nil
+            }
             viewportsY = [:]
             cursorTimeX = nil
         }
@@ -173,13 +290,23 @@ public final class ViewerState {
     /// Reset both the X-axis viewport and every Y-axis override to "auto-scale"
     /// behavior. Called by ⌘0 and double-click.
     public func resetViewport() {
-        viewportX = nil
+        resetXViewport()
         viewportsY = [:]
     }
 
-    /// Reset the X viewport only.
+    /// Reset every X viewport (global local, per-unit locals, and shared) to
+    /// "auto-scale" (`nil`). Covers both linked and unlinked modes and every
+    /// strip in stacked layout.
     public func resetXViewport() {
-        viewportX = nil
+        localViewportX = nil
+        localViewportsX.removeAll()
+        if sharedState.linkedXZoom {
+            sharedState.viewportX = nil
+        } else {
+            // Even in unlinked mode, clear shared so a subsequent re-link starts
+            // clean rather than restoring whatever was in shared from before.
+            sharedState.viewportX = nil
+        }
     }
 
     /// Remove every per-unit Y viewport override, letting each unit auto-scale to its

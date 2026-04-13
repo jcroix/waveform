@@ -5,21 +5,23 @@ import SwiftUI
 struct WaveformViewerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
+    /// App-level state shared by every window in the process. Currently holds the
+    /// linked X viewport + its on/off flag; Y stays per-window. Created once at
+    /// app launch and injected into each `MainWindowContainer` instance.
+    @State private var sharedState = SharedPlotState()
+
     var body: some Scene {
         WindowGroup("Waveform Viewer") {
-            MainWindowContainer()
+            MainWindowContainer(sharedState: sharedState)
         }
         .defaultSize(width: 1280, height: 800)
         .commands {
             // Keep the default `File → New Window` (⌘N) by appending our Open…
-            // command *after* .newItem instead of replacing it. Each new window
-            // gets its own ViewerState via `MainWindowContainer`.
+            // command *after* .newItem instead of replacing it.
             CommandGroup(after: .newItem) {
                 FileCommands()
             }
             // Append to the built-in View menu instead of creating a second one.
-            // The .sidebar command group (sidebar show/hide) lives in the default
-            // View menu, so `after: .sidebar` slots our items in right after it.
             CommandGroup(after: .sidebar) {
                 ViewCommands()
             }
@@ -27,33 +29,46 @@ struct WaveformViewerApp: App {
     }
 }
 
-/// Per-window wrapper that owns a fresh `ViewerState`. Each `WindowGroup` window
-/// instance creates its own container via SwiftUI's @State semantics, so opening
-/// a second window via File → New Window gives an independent ViewerState.
+/// Per-window wrapper that owns a fresh `ViewerState` referencing the app-level
+/// `SharedPlotState`. Each `WindowGroup` window instance creates its own
+/// container via SwiftUI's `@State` semantics, so opening a second window via
+/// File → New Window gives an independent ViewerState that still participates
+/// in the shared-viewport linking when enabled.
 ///
-/// The container also publishes `state` through `focusedSceneValue` so that
-/// command menus can read and mutate the active window's state via
-/// `@FocusedValue`.
+/// Publishes `state` through `focusedSceneValue` so command menus can read and
+/// mutate the active window's state via `@FocusedValue`.
 private struct MainWindowContainer: View {
-    @State private var state = ViewerState()
+    let sharedState: SharedPlotState
+    @State private var state: ViewerState
+
+    init(sharedState: SharedPlotState) {
+        self.sharedState = sharedState
+        _state = State(wrappedValue: ViewerState(sharedState: sharedState))
+    }
 
     var body: some View {
         MainWindow(state: state)
             .task {
-                // Belt-and-suspenders: re-assert foreground activation on appear
-                // in case the AppDelegate path hasn't fired yet.
                 NSApp.setActivationPolicy(.regular)
                 NSApp.activate(ignoringOtherApps: true)
             }
             .focusedSceneValue(\.activeViewerState, state)
+            // When the user flips linked → unlinked in any window, every
+            // window (including background ones) needs to capture the current
+            // shared viewport as its local starting point so their view
+            // doesn't suddenly jump. The window that triggered the toggle
+            // already handled its own capture inside `setLinkedXZoom`; this
+            // hook exists so background windows stay visually stable.
+            .onChange(of: sharedState.linkedXZoom) { oldValue, newValue in
+                if oldValue == true && newValue == false {
+                    state.captureSharedAsLocalViewport()
+                }
+            }
     }
 }
 
 // MARK: - Focused-value plumbing
 
-/// Focused-value key carrying the active window's `ViewerState`. Command menus
-/// read this via `@FocusedValue(\.activeViewerState)` so their actions target
-/// whichever window is frontmost when the user invokes the command.
 struct ActiveViewerStateKey: FocusedValueKey {
     typealias Value = ViewerState
 }
@@ -155,6 +170,14 @@ private struct ViewCommands: View {
         Divider()
 
         Toggle(isOn: Binding(
+            get: { state?.linkedXZoom ?? true },
+            set: { state?.linkedXZoom = $0 }
+        )) {
+            Text("Link Horizontal Zoom")
+        }
+        .disabled(state == nil)
+
+        Toggle(isOn: Binding(
             get: { state?.showGrid ?? true },
             set: { state?.showGrid = $0 }
         )) {
@@ -178,9 +201,6 @@ private struct ViewCommands: View {
 
         Divider()
 
-        // Plot-layout picker renders as a submenu of checked radio items in the
-        // macOS menu bar. Selecting a different option mutates the focused
-        // window's state so each window can independently choose its layout.
         Picker("Plot Layout", selection: plotLayoutBinding) {
             ForEach(PlotLayout.allCases, id: \.self) { option in
                 Text(option.label).tag(option)
