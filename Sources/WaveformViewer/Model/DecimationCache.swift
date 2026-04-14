@@ -10,19 +10,19 @@ import Foundation
 /// onto that queue rather than adding locks here.
 final class DecimationCache {
     private struct Key: Hashable {
-        let signalID: SignalID
+        let ref: SignalRef
         let sampleCount: Int
         let viewportMinBits: UInt64
         let viewportMaxBits: UInt64
         let pixelWidth: Int
 
         init(
-            signalID: SignalID,
+            ref: SignalRef,
             sampleCount: Int,
             viewport: ClosedRange<Double>,
             pixelWidth: Int
         ) {
-            self.signalID = signalID
+            self.ref = ref
             self.sampleCount = sampleCount
             self.viewportMinBits = viewport.lowerBound.bitPattern
             self.viewportMaxBits = viewport.upperBound.bitPattern
@@ -41,12 +41,13 @@ final class DecimationCache {
 
     func decimatedTrace(
         for signal: Signal,
+        ref: SignalRef,
         timeValues: [Double],
         viewport: ClosedRange<Double>,
         pixelWidth: Int
     ) -> DecimatedTrace {
         let key = Key(
-            signalID: signal.id,
+            ref: ref,
             sampleCount: signal.values.count,
             viewport: viewport,
             pixelWidth: pixelWidth

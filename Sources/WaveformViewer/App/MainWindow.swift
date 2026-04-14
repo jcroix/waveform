@@ -1,256 +1,101 @@
 import SwiftUI
 
+/// The single main application window. Left pane: file-hierarchy sidebar
+/// (multi-file forest with collapsible file nodes and gate checkboxes).
+/// Right pane: stacked unit plot panels, one per signal kind with at least
+/// one effective-visible signal, in a fixed voltage → current → power → logic
+/// order so panels don't shuffle as users tick boxes.
+///
+/// Each unit panel shares the X axis through the app's linked-X plot state,
+/// so zooming/panning in the voltage panel keeps the current panel in lockstep
+/// by default. Each panel owns its own Y viewport per unit.
 struct MainWindow: View {
-    @Bindable var state: ViewerState
+    @Bindable var state: WaveformAppState
 
     var body: some View {
         NavigationSplitView {
             SignalSidebar(state: state)
-                .navigationSplitViewColumnWidth(min: 240, ideal: 300)
+                .navigationSplitViewColumnWidth(min: 260, ideal: 320)
         } detail: {
-            DetailPlaceholder(state: state)
+            DetailPane(state: state)
         }
-        .navigationTitle(state.document?.title ?? "Waveform Viewer")
+        .navigationTitle(state.hubTitle)
         // NOTE: intentionally no `.toolbar { … }`. Bisection against macOS 26.x
         // SwiftUI showed that attaching any toolbar to this window — even a
         // single plain-text ToolbarItem — pegs WindowServer at 30–50% CPU at
-        // idle, presumably due to continuous window-chrome compositing. The
-        // File → Open command (⌘O) is wired via
-        // `WaveformViewerApp.commands` instead, and the in-content button in
-        // the empty-state view provides a visible affordance for first-time
-        // users. Do not reintroduce `.toolbar` on this window without
-        // re-testing WindowServer CPU first.
+        // idle, presumably due to continuous window-chrome compositing. File
+        // → Open… (⌘O) lives in WaveformViewerApp.commands instead, and the
+        // empty-state view below carries an in-content Open button. Don't
+        // reintroduce `.toolbar` without re-testing WindowServer CPU first.
     }
 }
 
-private struct DetailPlaceholder: View {
-    @Bindable var state: ViewerState
+private struct DetailPane: View {
+    @Bindable var state: WaveformAppState
 
     var body: some View {
         Group {
-            if let document = state.document {
-                loadedView(document: document)
-            } else if let error = state.loadError {
-                ContentUnavailableView {
-                    Label("Failed to open", systemImage: "exclamationmark.triangle")
-                } description: {
-                    Text(error)
-                } actions: {
-                    Button("Choose Another File…") {
-                        state.presentOpenPanel()
-                    }
-                    .keyboardShortcut("o", modifiers: .command)
-                }
+            if state.documents.isEmpty {
+                emptyState
+            } else if visibleUnits.isEmpty {
+                noTracesSelected
             } else {
-                ContentUnavailableView {
-                    Label("No waveform loaded", systemImage: "waveform")
-                } description: {
-                    Text("Open a .tr0 or .out file to begin.")
-                } actions: {
-                    Button("Open…") {
-                        state.presentOpenPanel()
-                    }
-                    .keyboardShortcut("o", modifiers: .command)
-                }
+                stackedPanels
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    @ViewBuilder
-    private func loadedView(document: WaveformDocument) -> some View {
-        if state.visibleSignalIDs.isEmpty {
-            noTracesSelected(document: document)
-        } else {
-            VStack(spacing: 0) {
-                traceLegend(document: document)
-                Divider()
-                plotBody(document: document)
-                Divider()
-                PlotStatusBar(
-                    cursorTime: state.cursorTimeX,
-                    viewport: state.viewportX,
-                    fullSpan: fullSpan(for: document)
-                )
-            }
-        }
+    /// The units that currently have at least one effective-visible signal,
+    /// returned in canonical order (voltage → current → power → logic). The
+    /// canonical order means panels don't jump around when users flip
+    /// checkboxes on and off.
+    private var visibleUnits: [SignalKind] {
+        let present = Set(state.visibleUnits())
+        return SignalKind.routable.filter { present.contains($0) }
     }
 
-    private func fullSpan(for document: WaveformDocument) -> ClosedRange<Double>? {
-        guard let start = document.timeValues.first,
-              let end = document.timeValues.last,
-              end > start else { return nil }
-        return start...end
-    }
-
-    /// Picks a layout strategy based on `state.plotLayout`. In stacked-strips mode,
-    /// traces are grouped by unit and each group gets its own pane stacked vertically;
-    /// a shared viewport in `state.viewportX` keeps the X axes aligned across strips.
-    /// In dual-Y mode, a single pane plots everything with the first unit group on
-    /// the left axis and the second on the right.
-    @ViewBuilder
-    private func plotBody(document: WaveformDocument) -> some View {
-        let groups = state.visibleSignalGroups()
-
-        switch state.plotLayout {
-        case .stackedStrips:
-            stackedStrips(document: document, groups: groups)
-        case .dualYAxis:
-            dualAxisPane(document: document, groups: groups)
-        }
-    }
-
-    @ViewBuilder
-    private func stackedStrips(
-        document: WaveformDocument,
-        groups: [PlotUnitGroup]
-    ) -> some View {
-        if groups.isEmpty {
-            EmptyView()
-        } else {
-            VStack(spacing: 0) {
-                ForEach(Array(groups.enumerated()), id: \.element.id) { index, group in
-                    if index > 0 {
-                        Divider()
-                    }
-                    PlotView(
-                        document: document,
-                        assignment: PlotTraceAssignment(
-                            primarySignalIDs: group.signalIDs,
-                            primaryUnit: group.unit
-                        ),
-                        // Each stacked strip reads and writes its OWN unit's X
-                        // viewport entry. In linked mode these all collapse to
-                        // `sharedState.viewportX` via the state's routing logic;
-                        // in unlinked mode each strip is independent.
-                        viewport: state.xViewport(forUnit: group.unit),
-                        viewportsY: state.viewportsY,
-                        focusedSignalID: state.focusedSignalID,
-                        cursorTimeX: state.cursorTimeX,
-                        showGrid: state.showGrid,
-                        onViewportChange: { [unit = group.unit] newValue in
-                            state.setXViewport(newValue, forUnit: unit)
-                        },
-                        onYViewportChange: { unit, range in
-                            if let range = range {
-                                state.viewportsY[unit] = range
-                            } else {
-                                state.viewportsY.removeValue(forKey: unit)
-                            }
-                        },
-                        onResetAll: { state.resetViewport() },
-                        onFocusChange: { state.focusedSignalID = $0 },
-                        onCursorChange: { state.cursorTimeX = $0 }
-                    )
-                    .id(document.sourceURL.absoluteString + "#" + group.unit)
+    @ViewBuilder private var emptyState: some View {
+        if let error = state.loadError {
+            ContentUnavailableView {
+                Label("Failed to open", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(error)
+            } actions: {
+                Button("Choose Another File…") {
+                    state.presentOpenPanel()
                 }
+                .keyboardShortcut("o", modifiers: .command)
             }
-        }
-    }
-
-    @ViewBuilder
-    private func dualAxisPane(
-        document: WaveformDocument,
-        groups: [PlotUnitGroup]
-    ) -> some View {
-        if groups.isEmpty {
-            EmptyView()
         } else {
-            PlotView(
-                document: document,
-                assignment: dualAxisAssignment(groups: groups),
-                viewport: state.viewportX,
-                viewportsY: state.viewportsY,
-                focusedSignalID: state.focusedSignalID,
-                cursorTimeX: state.cursorTimeX,
-                showGrid: state.showGrid,
-                onViewportChange: { state.viewportX = $0 },
-                onYViewportChange: { unit, range in
-                    if let range = range {
-                        state.viewportsY[unit] = range
-                    } else {
-                        state.viewportsY.removeValue(forKey: unit)
-                    }
-                },
-                onResetAll: { state.resetViewport() },
-                onFocusChange: { state.focusedSignalID = $0 },
-                onCursorChange: { state.cursorTimeX = $0 }
-            )
-            .id(document.sourceURL.absoluteString + "#dualAxis")
-        }
-    }
-
-    /// Maps an ordered list of unit groups onto a dual-axis plot assignment. The first
-    /// group goes on the left (primary) Y axis; the second on the right (secondary).
-    /// Any additional groups are folded onto the primary axis since the plot only has
-    /// two axes to offer — users with three or more unit kinds in a single window
-    /// should use stacked strips instead, which gives each unit its own pane.
-    private func dualAxisAssignment(groups: [PlotUnitGroup]) -> PlotTraceAssignment {
-        let primary = groups[0]
-        let secondary: PlotUnitGroup? = groups.count >= 2 ? groups[1] : nil
-
-        var primaryIDs = primary.signalIDs
-        var primaryUnit = primary.unit
-        if groups.count > 2 {
-            for group in groups[2...] {
-                primaryIDs.append(contentsOf: group.signalIDs)
-            }
-            if !primaryUnit.isEmpty {
-                primaryUnit += "*"  // hint that the primary axis mixes units
-            }
-        }
-
-        return PlotTraceAssignment(
-            primarySignalIDs: primaryIDs,
-            primaryUnit: primaryUnit,
-            secondarySignalIDs: secondary?.signalIDs ?? [],
-            secondaryUnit: secondary?.unit ?? ""
-        )
-    }
-
-    @ViewBuilder
-    private func traceLegend(document: WaveformDocument) -> some View {
-        HStack(spacing: 14) {
-            ForEach(state.visibleSignalIDs, id: \.self) { signalID in
-                if let signal = document.signal(withID: signalID) {
-                    let isFocused = state.focusedSignalID == signalID
-                    HStack(spacing: 6) {
-                        Circle()
-                            .fill(Color(nsColor: ColorPalette.stableColor(for: signalID)))
-                            .frame(width: isFocused ? 12 : 10, height: isFocused ? 12 : 10)
-                        Text(signal.displayName)
-                            .font(.caption)
-                            .fontWeight(isFocused ? .semibold : .regular)
-                        Text("(\(signal.unit))")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+            ContentUnavailableView {
+                Label("No waveform loaded", systemImage: "waveform")
+            } description: {
+                Text("Open one or more .tr0 or .out files to begin. Files load additively; pick several at once to compare variants.")
+            } actions: {
+                Button("Open…") {
+                    state.presentOpenPanel()
                 }
+                .keyboardShortcut("o", modifiers: .command)
             }
-            Spacer()
-            Text("\(document.sampleCount) samples")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
     }
 
-    @ViewBuilder
-    private func noTracesSelected(document: WaveformDocument) -> some View {
+    @ViewBuilder private var noTracesSelected: some View {
         VStack(spacing: 12) {
             Image(systemName: "waveform")
                 .font(.system(size: 48, weight: .light))
                 .foregroundStyle(.tertiary)
-            Text(document.title)
-                .font(.title3)
-            HStack(spacing: 18) {
-                Label("\(document.signals.count) signals", systemImage: "list.bullet")
-                Label("\(document.sampleCount) samples", systemImage: "chart.xyaxis.line")
-                Label(document.analysisKind.rawValue.uppercased(), systemImage: "function")
+            if state.loadError != nil {
+                Label(state.loadError ?? "", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
             }
-            .font(.callout)
-            .foregroundStyle(.secondary)
+            Text(state.hubTitle)
+                .font(.title3)
+            Text(summaryLine)
+                .font(.callout)
+                .foregroundStyle(.secondary)
             Text("Check signals in the sidebar to plot them, or use View → Show All Signals.")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
@@ -258,5 +103,29 @@ private struct DetailPlaceholder: View {
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var summaryLine: String {
+        let totalSignals = state.documents.reduce(0) { $0 + $1.document.signals.count }
+        let fileCount = state.documents.count
+        let fileWord = fileCount == 1 ? "file" : "files"
+        return "\(fileCount) \(fileWord) · \(totalSignals) signals"
+    }
+
+    @ViewBuilder private var stackedPanels: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(visibleUnits.enumerated()), id: \.element) { index, unit in
+                if index > 0 {
+                    Divider()
+                }
+                UnitPlotPanel(state: state, unit: unit)
+            }
+            Divider()
+            PlotStatusBar(
+                cursorTime: state.cursorTimeX,
+                viewport: state.xViewport(for: visibleUnits.first ?? .voltage),
+                fullSpan: state.overallTimeRange
+            )
+        }
     }
 }

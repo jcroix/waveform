@@ -2,6 +2,84 @@ import Foundation
 
 public typealias SignalID = Int
 
+/// Globally-unique identifier for a loaded waveform file. Each `LoadedDocument`
+/// gets a fresh `DocumentID` at load time so that overlapping signal names in
+/// different files stay distinct throughout the app. Stored as a `UUID` so it
+/// survives copying and equality comparison without any central registry.
+public struct DocumentID: Hashable, Sendable {
+    public let raw: UUID
+
+    public init() {
+        self.raw = UUID()
+    }
+
+    public init(raw: UUID) {
+        self.raw = raw
+    }
+}
+
+/// Globally-unique signal identity. Couples a document-local `SignalID` (an
+/// index into `WaveformDocument.signals`) with its owning `DocumentID`, so the
+/// same local index in two different loaded files refers to two different
+/// signals. This is the handle threaded through every app-level data structure
+/// that needs to point at a signal across multiple files: visibility lists,
+/// focus tracking, plot traces, hit testing, decimation cache keys.
+public struct SignalRef: Hashable, Sendable {
+    public let document: DocumentID
+    public let local: SignalID
+
+    public init(document: DocumentID, local: SignalID) {
+        self.document = document
+        self.local = local
+    }
+}
+
+/// Identifies a specific `HierarchyNode` inside the multi-file sidebar forest.
+/// File-level nodes use an empty `fullPath`; interior and leaf nodes use their
+/// dotted path inside the owning document. Stored in the `gateOff` set so that
+/// unchecking a parent node can be represented and queried in O(1) when the
+/// plot filters visible traces.
+public struct HierarchyKey: Hashable, Sendable {
+    public let document: DocumentID
+    public let fullPath: String
+
+    public init(document: DocumentID, fullPath: String) {
+        self.document = document
+        self.fullPath = fullPath
+    }
+}
+
+/// A freshly-loaded `WaveformDocument` wrapped with its app-assigned
+/// `DocumentID`. `WaveformAppState` stores `[LoadedDocument]` rather than
+/// `[WaveformDocument]` so the parser layer stays unaware of multi-file
+/// identity — parsing still produces pure `WaveformDocument` values, and the
+/// wrapper only exists in the UI/state layer.
+public struct LoadedDocument: Sendable, Identifiable {
+    public let id: DocumentID
+    public let document: WaveformDocument
+
+    public init(id: DocumentID = DocumentID(), document: WaveformDocument) {
+        self.id = id
+        self.document = document
+    }
+
+    public var signals: [Signal] { document.signals }
+    public var timeValues: [Double] { document.timeValues }
+    public var sourceURL: URL { document.sourceURL }
+    public var title: String { document.title }
+
+    public func signal(withLocalID id: SignalID) -> Signal? {
+        document.signal(withID: id)
+    }
+
+    public var timeRange: ClosedRange<Double>? {
+        guard let first = timeValues.first, let last = timeValues.last, last > first else {
+            return nil
+        }
+        return first...last
+    }
+}
+
 public struct Signal: Sendable, Identifiable {
     public let id: SignalID
     public let displayName: String    // exactly as stored in source: "v(x1.x2.net)", "i(vdd)", …

@@ -23,10 +23,25 @@ enum ColorPalette {
         trace[(index % trace.count + trace.count) % trace.count]
     }
 
-    /// Stable per-signal color keyed off `SignalID`. Each signal in a document keeps
-    /// the same color regardless of visibility toggles so the sidebar icon and the
-    /// plot trace always agree. Collisions are inevitable past the palette length
-    /// (currently 12); a future Phase 9.5 will let users override via a context menu.
+    /// Stable per-signal color keyed off a globally-unique `SignalRef`. Each
+    /// signal in each loaded file keeps the same color regardless of visibility
+    /// toggles so the sidebar icon and the plot trace always agree. The
+    /// document-id component of `SignalRef` is folded into the palette index so
+    /// the same `v(clk)` loaded from two different files still picks two
+    /// different colors — which is exactly what the user needs when overlaying
+    /// variant waveforms. Collisions are still possible past the palette length
+    /// (12 slots) but they won't cluster on "signal zero of every file".
+    static func stableColor(for ref: SignalRef) -> NSColor {
+        var hasher = Hasher()
+        hasher.combine(ref.document)
+        hasher.combine(ref.local)
+        let digest = hasher.finalize()
+        return color(forTraceIndex: digest)
+    }
+
+    /// Legacy single-document accessor kept for code paths that still operate
+    /// on a document-local `SignalID` without knowing which file owns it. New
+    /// code should prefer `stableColor(for:SignalRef)`.
     static func stableColor(for signalID: SignalID) -> NSColor {
         color(forTraceIndex: signalID)
     }

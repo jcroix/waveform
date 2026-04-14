@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct SignalSidebar: View {
-    @Bindable var state: ViewerState
+    @Bindable var state: WaveformAppState
 
     var body: some View {
         VStack(spacing: 0) {
@@ -35,27 +35,31 @@ struct SignalSidebar: View {
     }
 
     @ViewBuilder private var content: some View {
-        if let document = state.document {
-            SignalOutlineView(
-                document: document,
-                filterText: state.filterText,
-                // Reading these here subscribes the sidebar to them through the
-                // Observation framework so menu commands, plot clicks, and cursor
-                // moves trigger SwiftUI re-renders and, in turn, `updateNSView`.
-                visibleSignalIDs: state.visibleSignalIDs,
-                cursorTimeX: state.cursorTimeX,
-                state: state
-            )
-        } else {
+        if state.fileNodes.isEmpty {
             VStack(spacing: 8) {
                 Image(systemName: "waveform.slash")
                     .font(.system(size: 26, weight: .light))
                     .foregroundStyle(.tertiary)
-                Text("No file open")
+                Text("No files open")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                Text("File → Open… (⌘O)")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            SignalOutlineView(
+                fileNodes: state.fileNodes,
+                filterText: state.filterText,
+                // Reading the two collections here subscribes the sidebar to
+                // them through the Observation framework so changes in either
+                // drive updateNSView, which refreshes cell content.
+                checkedSignals: state.checkedSignals,
+                gateOff: state.gateOff,
+                cursorTimeX: state.cursorTimeX,
+                state: state
+            )
         }
     }
 }

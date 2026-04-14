@@ -199,10 +199,12 @@ private func uniformlySampled(count: Int, generator: (Int) -> Float) -> (times: 
         unit: "V",
         values: v
     )
+    let ref = SignalRef(document: DocumentID(), local: 0)
     let cache = DecimationCache(maxEntries: 4)
     let viewport: ClosedRange<Double> = 0...999
     let first = cache.decimatedTrace(
         for: signal,
+        ref: ref,
         timeValues: t,
         viewport: viewport,
         pixelWidth: 100
@@ -211,6 +213,7 @@ private func uniformlySampled(count: Int, generator: (Int) -> Float) -> (times: 
 
     let second = cache.decimatedTrace(
         for: signal,
+        ref: ref,
         timeValues: t,
         viewport: viewport,
         pixelWidth: 100
@@ -231,12 +234,13 @@ private func uniformlySampled(count: Int, generator: (Int) -> Float) -> (times: 
         unit: "V",
         values: v
     )
+    let ref = SignalRef(document: DocumentID(), local: 0)
     let cache = DecimationCache(maxEntries: 2)
 
     // Three distinct pixelWidths → cache exceeds capacity and evicts the oldest.
-    _ = cache.decimatedTrace(for: signal, timeValues: t, viewport: 0...99, pixelWidth: 10)
-    _ = cache.decimatedTrace(for: signal, timeValues: t, viewport: 0...99, pixelWidth: 20)
-    _ = cache.decimatedTrace(for: signal, timeValues: t, viewport: 0...99, pixelWidth: 30)
+    _ = cache.decimatedTrace(for: signal, ref: ref, timeValues: t, viewport: 0...99, pixelWidth: 10)
+    _ = cache.decimatedTrace(for: signal, ref: ref, timeValues: t, viewport: 0...99, pixelWidth: 20)
+    _ = cache.decimatedTrace(for: signal, ref: ref, timeValues: t, viewport: 0...99, pixelWidth: 30)
     #expect(cache.entryCount == 2)
 }
 
@@ -251,18 +255,19 @@ private func uniformlySampled(count: Int, generator: (Int) -> Float) -> (times: 
         unit: "V",
         values: v
     )
+    let ref = SignalRef(document: DocumentID(), local: 0)
     let cache = DecimationCache(maxEntries: 2)
 
-    _ = cache.decimatedTrace(for: signal, timeValues: t, viewport: 0...99, pixelWidth: 10)
-    _ = cache.decimatedTrace(for: signal, timeValues: t, viewport: 0...99, pixelWidth: 20)
+    _ = cache.decimatedTrace(for: signal, ref: ref, timeValues: t, viewport: 0...99, pixelWidth: 10)
+    _ = cache.decimatedTrace(for: signal, ref: ref, timeValues: t, viewport: 0...99, pixelWidth: 20)
 
     // Touch width=10 again so it becomes most-recently-used. Then inserting a third
     // width should evict width=20 (the oldest), not width=10.
-    _ = cache.decimatedTrace(for: signal, timeValues: t, viewport: 0...99, pixelWidth: 10)
-    _ = cache.decimatedTrace(for: signal, timeValues: t, viewport: 0...99, pixelWidth: 30)
+    _ = cache.decimatedTrace(for: signal, ref: ref, timeValues: t, viewport: 0...99, pixelWidth: 10)
+    _ = cache.decimatedTrace(for: signal, ref: ref, timeValues: t, viewport: 0...99, pixelWidth: 30)
     #expect(cache.entryCount == 2)
 
     // A fourth request for width=10 should be a cache hit (entryCount unchanged).
-    _ = cache.decimatedTrace(for: signal, timeValues: t, viewport: 0...99, pixelWidth: 10)
+    _ = cache.decimatedTrace(for: signal, ref: ref, timeValues: t, viewport: 0...99, pixelWidth: 10)
     #expect(cache.entryCount == 2)
 }

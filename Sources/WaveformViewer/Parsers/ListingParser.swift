@@ -2,12 +2,44 @@ import Foundation
 
 // MARK: - Public types
 
-public enum SignalKind: Sendable, Equatable {
+public enum SignalKind: Sendable, Equatable, Hashable {
     case voltage
     case current
     case power
     case logicVoltage
     case unknown(String)
+
+    /// Human-readable window label (e.g. "Voltage", "Current", "Power", "Logic").
+    /// Used for per-unit plot window titles and View-menu entries.
+    public var displayName: String {
+        switch self {
+        case .voltage:      return "Voltage"
+        case .current:      return "Current"
+        case .power:        return "Power"
+        case .logicVoltage: return "Logic"
+        case .unknown:      return "Other"
+        }
+    }
+
+    /// Stable string used to construct SwiftUI `Window` scene IDs. Must remain
+    /// ASCII and stable across releases — app-state preservation and the
+    /// `openWindow(id:)` routing in `SignalOutlineView` both key off these.
+    public var routingID: String {
+        switch self {
+        case .voltage:      return "voltage"
+        case .current:      return "current"
+        case .power:        return "power"
+        case .logicVoltage: return "logic"
+        case .unknown:      return "other"
+        }
+    }
+
+    /// Every concrete plot-window unit the app pre-declares as a SwiftUI
+    /// `Window` scene. `unknown` is excluded because its associated value means
+    /// there's no single window to route to.
+    public static var routable: [SignalKind] {
+        [.voltage, .current, .power, .logicVoltage]
+    }
 }
 
 public enum AnalysisKind: String, Sendable, Equatable {
