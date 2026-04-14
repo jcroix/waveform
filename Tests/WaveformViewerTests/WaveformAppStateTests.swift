@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import WaveformViewer
@@ -6,7 +7,10 @@ import Testing
 
 @MainActor
 private func makeState() -> WaveformAppState {
-    WaveformAppState(sharedState: SharedPlotState())
+    let state = WaveformAppState(sharedState: SharedPlotState())
+    // Tests must NEVER write to the user's real `~/.waveform-viewer.json`.
+    state.autoSaveEnabled = false
+    return state
 }
 
 /// Build a small synthetic `WaveformDocument` without going through the
@@ -325,6 +329,100 @@ private func sampleValues(count: Int, seed: Float) -> [Float] {
     #expect(state.effectiveVisibleSignals(unit: .current) == [refI])
     #expect(state.effectiveVisibleSignals(unit: .power)   == [refP])
     #expect(state.visibleUnits() == [.voltage, .current, .power])
+}
+
+// MARK: - Duplicate file detection
+
+@MainActor
+@Test func openingSameFileTwiceIsDedupedWithError() throws {
+    // Use the bundled fixture so we're hitting the real WaveformDocument.load
+    // code path instead of the test-only inject seam.
+    let state = makeState()
+    guard let fixture = Bundle.module.url(
+        forResource: "lfsr9-flat",
+        withExtension: "tr0",
+        subdirectory: "Fixtures"
+    ) else {
+        Issue.record("missing lfsr9-flat.tr0 fixture")
+        return
+    }
+
+    state.open(urls: [fixture])
+    #expect(state.documents.count == 1)
+    #expect(state.loadError == nil)
+
+    // Second open of the same URL should be skipped and report the dupe
+    // in loadError without touching the existing document.
+    let firstID = state.documents[0].id
+    state.open(urls: [fixture])
+    #expect(state.documents.count == 1)
+    #expect(state.documents[0].id == firstID)
+    #expect(state.loadError != nil)
+    #expect(state.loadError?.contains("already open") == true)
+
+    // Closing the document should free its slot so a subsequent open of
+    // the same URL succeeds again.
+    state.closeDocument(firstID)
+    #expect(state.documents.isEmpty)
+    state.open(urls: [fixture])
+    #expect(state.documents.count == 1)
+    #expect(state.documents[0].id != firstID)  // freshly-minted DocumentID
+    #expect(state.loadError == nil)
+}
+
+// MARK: - Session snapshot round-trip
+
+@MainActor
+@Test func snapshotRoundTripPreservesFilesSignalsAndColors() throws {
+    let state = makeState()
+    guard let fixture = Bundle.module.url(
+        forResource: "lfsr9-flat",
+        withExtension: "tr0",
+        subdirectory: "Fixtures"
+    ) else {
+        Issue.record("missing lfsr9-flat.tr0 fixture")
+        return
+    }
+
+    state.open(urls: [fixture])
+    #expect(state.documents.count == 1)
+
+    let firstSignal = state.documents[0].signals[0]
+    let firstRef = SignalRef(document: state.documents[0].id, local: firstSignal.id)
+    state.setSignalChecked(firstRef, checked: true)
+    state.setCustomColor(
+        NSColor(srgbRed: 0.25, green: 0.5, blue: 0.75, alpha: 1),
+        for: firstRef
+    )
+
+    let snapshot = state.makeSnapshot()
+    #expect(snapshot.openFiles.count == 1)
+    #expect(snapshot.selectedSignals.count == 1)
+    #expect(snapshot.selectedSignals[0].displayName == firstSignal.displayName)
+    #expect(snapshot.customColors.count == 1)
+    #expect(abs(snapshot.customColors[0].red - 0.25) < 1e-4)
+    #expect(abs(snapshot.customColors[0].green - 0.5) < 1e-4)
+    #expect(abs(snapshot.customColors[0].blue - 0.75) < 1e-4)
+
+    // Round-trip via JSON to make sure SessionSnapshot is fully Codable.
+    let encoded = try JSONEncoder().encode(snapshot)
+    let decoded = try JSONDecoder().decode(SessionSnapshot.self, from: encoded)
+    #expect(decoded == snapshot)
+
+    // Wipe state, then apply the decoded snapshot. Files reload, the
+    // checked signal comes back, and the color override is restored —
+    // even though the freshly-minted DocumentID is different from the
+    // first round.
+    let originalDocID = state.documents[0].id
+    state.applySnapshot(decoded)
+    #expect(state.documents.count == 1)
+    #expect(state.documents[0].id != originalDocID)
+    #expect(state.checkedSignals.count == 1)
+    let newRef = state.checkedSignals[0]
+    #expect(state.resolve(newRef)?.displayName == firstSignal.displayName)
+    let restoredColor = state.customColors[newRef]
+    #expect(restoredColor != nil)
+    #expect(abs((restoredColor?.red ?? 0) - 0.25) < 1e-4)
 }
 
 // MARK: - Test-only helper

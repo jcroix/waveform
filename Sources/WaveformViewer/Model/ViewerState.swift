@@ -68,6 +68,15 @@ public final class WaveformAppState {
     /// owning file is closed.
     public var focusedSignalRef: SignalRef?
 
+    /// Per-signal color overrides set via the sidebar's color well. Signals
+    /// not present in this map fall back to the palette's hash-derived
+    /// default (`ColorPalette.stableColor(for: ref)`). Stored as CGColor
+    /// triples so the map is `Sendable` and diffable for `RebuildKey` — the
+    /// raw `NSColor` is dynamic (light/dark aware), but once the user picks
+    /// a specific color we want it to stay that color across appearance
+    /// changes.
+    public var customColors: [SignalRef: RGBColor] = [:]
+
     // MARK: - Plot viewport (X)
 
     /// Per-unit local X viewports, keyed by `SignalKind`. Used when linked-X is
@@ -94,6 +103,18 @@ public final class WaveformAppState {
     /// Reference to the app-level shared-X plot state. Still exists so multi-
     /// window linking works across hub + every unit window.
     public let sharedState: SharedPlotState
+
+    // MARK: - Session persistence
+
+    /// Set to `true` while `restoreSession()` is rewriting app state so
+    /// that the mutation hooks in `open`, `setSignalChecked`, etc. don't
+    /// write an inconsistent mid-restore snapshot back to disk.
+    private var isRestoring: Bool = false
+
+    /// Master switch for the auto-save hooks. Production leaves this
+    /// `true`. Unit tests set it to `false` so they can mutate state
+    /// without writing to the user's real home-directory dot-file.
+    public var autoSaveEnabled: Bool = true
 
     public init(sharedState: SharedPlotState) {
         self.sharedState = sharedState
@@ -186,14 +207,24 @@ public final class WaveformAppState {
     }
 
     /// Load one or more files and append them to the currently-loaded set.
-    /// Parse errors for individual files are collected into `loadError` with
-    /// newline separators; successfully-parsed files are still appended so
-    /// partial multi-file opens don't lose data.
+    /// Parse errors and duplicate-file skips for individual URLs are both
+    /// collected into `loadError` with newline separators; successfully-
+    /// parsed new files are appended so partial multi-file opens don't
+    /// lose data.
+    ///
+    /// Duplicate detection uses the symlink-resolved absolute path of each
+    /// URL against every currently-loaded document's `sourceURL`. Closing
+    /// a file removes it from `documents`, which releases it for
+    /// re-opening next time the user picks it.
     public func open(urls: [URL]) {
         var errors: [String] = []
         let wasEmpty = documents.isEmpty
 
         for url in urls {
+            if let existing = alreadyLoadedDocument(for: url) {
+                errors.append("\(url.lastPathComponent): already open as “\(existing.sourceURL.lastPathComponent)”")
+                continue
+            }
             do {
                 let doc = try WaveformDocument.load(from: url)
                 let id = DocumentID()
@@ -222,6 +253,27 @@ public final class WaveformAppState {
             filterText = ""
             cursorTimeX = nil
         }
+
+        saveSession()
+    }
+
+    /// Returns the already-loaded document (if any) whose source file is
+    /// the same on-disk location as `url`. Comparison uses the symlink-
+    /// resolved absolute path so `/private/var/.../x.tr0` and
+    /// `/var/.../x.tr0` are treated as identical, and re-opening through
+    /// a relative path like `./x.tr0` still hits the existing entry.
+    private func alreadyLoadedDocument(for url: URL) -> WaveformDocument? {
+        let target = canonicalPath(for: url)
+        for loaded in documents {
+            if canonicalPath(for: loaded.sourceURL) == target {
+                return loaded.document
+            }
+        }
+        return nil
+    }
+
+    private func canonicalPath(for url: URL) -> String {
+        url.resolvingSymlinksInPath().standardizedFileURL.path
     }
 
     /// Remove a loaded file from the app state. Prunes every reference to its
@@ -233,6 +285,7 @@ public final class WaveformAppState {
         fileNodes.removeAll { $0.documentID == id }
         checkedSignals.removeAll { $0.document == id }
         gateOff = gateOff.filter { $0.document != id }
+        customColors = customColors.filter { $0.key.document != id }
         if focusedSignalRef?.document == id {
             focusedSignalRef = nil
         }
@@ -263,6 +316,8 @@ public final class WaveformAppState {
                 cursorTimeX = min(max(cursor, full.lowerBound), full.upperBound)
             }
         }
+
+        saveSession()
     }
 
     /// Show an `NSOpenPanel` and, on confirmation, load every selected file
@@ -419,6 +474,7 @@ public final class WaveformAppState {
                 focusedSignalRef = nil
             }
         }
+        saveSession()
     }
 
     /// Toggle the hierarchy gate for `key`. `on == true` opens the gate (the
@@ -479,6 +535,106 @@ public final class WaveformAppState {
         ancestorKeys(of: ref)
     }
 
+    // MARK: - Color overrides
+
+    /// The effective color for a given signal: the user's explicit override
+    /// if one exists, otherwise the palette default keyed off the ref's
+    /// global hash. Consumers should call this instead of
+    /// `ColorPalette.stableColor(for:)` so the override path is honored.
+    public func color(for ref: SignalRef) -> NSColor {
+        if let rgb = customColors[ref] {
+            return NSColor(
+                srgbRed: CGFloat(rgb.red),
+                green: CGFloat(rgb.green),
+                blue: CGFloat(rgb.blue),
+                alpha: CGFloat(rgb.alpha)
+            )
+        }
+        return ColorPalette.stableColor(for: ref)
+    }
+
+    /// Set or clear the per-signal color override. Passing `nil` removes
+    /// the override and falls the signal back to its palette default.
+    public func setCustomColor(_ color: NSColor?, for ref: SignalRef) {
+        guard let color = color else {
+            customColors.removeValue(forKey: ref)
+            saveSession()
+            return
+        }
+        if let sRGB = color.usingColorSpace(.sRGB) {
+            customColors[ref] = RGBColor(
+                red: Double(sRGB.redComponent),
+                green: Double(sRGB.greenComponent),
+                blue: Double(sRGB.blueComponent),
+                alpha: Double(sRGB.alphaComponent)
+            )
+        } else {
+            customColors[ref] = RGBColor(
+                red: Double(color.redComponent),
+                green: Double(color.greenComponent),
+                blue: Double(color.blueComponent),
+                alpha: Double(color.alphaComponent)
+            )
+        }
+        saveSession()
+    }
+
+    // MARK: - Panning
+
+    /// Pan every visible unit's X viewport by `fraction` of its current
+    /// span. Positive values pan right (later in time), negative values
+    /// pan left. In linked mode this collapses to a single shared
+    /// viewport write.
+    public func panX(by fraction: Double) {
+        guard let full = overallTimeRange, fraction != 0 else { return }
+
+        let units = sharedState.linkedXZoom ? [SignalKind.voltage] : visibleUnits()
+        for unit in units {
+            let current = effectiveXViewport(for: unit, full: full)
+            let span = current.upperBound - current.lowerBound
+            guard span > 0 else { continue }
+            let shift = span * fraction
+
+            var lower = current.lowerBound + shift
+            var upper = current.upperBound + shift
+            if lower < full.lowerBound {
+                let delta = full.lowerBound - lower
+                lower += delta
+                upper += delta
+            }
+            if upper > full.upperBound {
+                let delta = upper - full.upperBound
+                lower -= delta
+                upper -= delta
+            }
+            lower = max(lower, full.lowerBound)
+            upper = min(upper, full.upperBound)
+            guard lower < upper else { continue }
+
+            if abs(lower - full.lowerBound) < 1e-18 && abs(upper - full.upperBound) < 1e-18 {
+                setXViewport(nil, for: unit)
+            } else {
+                setXViewport(lower...upper, for: unit)
+            }
+        }
+    }
+
+    /// Pan every visible unit's Y viewport by `fraction` of its current
+    /// span. Positive values pan up (higher values), negative values pan
+    /// down. Each unit's shift is independent — voltage and current panels
+    /// each read and write their own Y viewport.
+    public func panY(by fraction: Double) {
+        guard fraction != 0 else { return }
+        for unit in visibleUnits() {
+            let current = viewportsY[unit] ?? fullYRange(for: unit)
+            guard let current = current else { continue }
+            let span = current.upperBound - current.lowerBound
+            guard span > 0 else { continue }
+            let shift = span * fraction
+            viewportsY[unit] = (current.lowerBound + shift)...(current.upperBound + shift)
+        }
+    }
+
     // MARK: - Bulk visibility commands
 
     /// Check every signal in every loaded document. Used by View → Show All
@@ -489,12 +645,14 @@ public final class WaveformAppState {
         }
         // Open every gate so the user actually sees everything.
         gateOff.removeAll()
+        saveSession()
     }
 
     /// Uncheck every signal. Focus is cleared as a side effect.
     public func hideAllSignals() {
         checkedSignals.removeAll()
         focusedSignalRef = nil
+        saveSession()
     }
 
     // MARK: - Z-order (Phase 9.2)
@@ -505,6 +663,7 @@ public final class WaveformAppState {
               index != checkedSignals.count - 1 else { return }
         checkedSignals.remove(at: index)
         checkedSignals.append(ref)
+        saveSession()
     }
 
     public func moveFocusedToBack() {
@@ -513,6 +672,7 @@ public final class WaveformAppState {
               index != 0 else { return }
         checkedSignals.remove(at: index)
         checkedSignals.insert(ref, at: 0)
+        saveSession()
     }
 
     // MARK: - Viewport commands
@@ -765,5 +925,181 @@ public final class WaveformAppState {
             return nil
         }
         return lower...upper
+    }
+
+    // MARK: - Session save / restore
+
+    /// Build a `SessionSnapshot` from the current state and write it to
+    /// `~/.waveform-viewer.json`. Called from every mutation entry point
+    /// so the on-disk session is always in sync; no-ops while
+    /// `isRestoring` is true so a partial mid-restore state never lands
+    /// on disk. Errors are logged but never thrown — a session-save
+    /// failure shouldn't be allowed to break a user action.
+    public func saveSession() {
+        guard autoSaveEnabled, !isRestoring else { return }
+        let snapshot = makeSnapshot()
+        do {
+            try SessionStore.save(snapshot)
+        } catch {
+            NSLog("waveform-viewer: failed to save session: \(error)")
+        }
+    }
+
+    /// Build a `SessionSnapshot` describing the current loaded files,
+    /// checked signals (in z-order), and per-signal color overrides.
+    /// Exposed as `internal` so unit tests can round-trip without
+    /// touching the filesystem.
+    internal func makeSnapshot() -> SessionSnapshot {
+        var snapshot = SessionSnapshot(version: SessionStore.currentSchemaVersion)
+        snapshot.openFiles = documents.map { canonicalPath(for: $0.sourceURL) }
+
+        for ref in checkedSignals {
+            guard let signal = resolve(ref),
+                  let loaded = documents.first(where: { $0.id == ref.document }) else {
+                continue
+            }
+            snapshot.selectedSignals.append(SelectedSignalEntry(
+                filePath: canonicalPath(for: loaded.sourceURL),
+                displayName: signal.displayName
+            ))
+        }
+
+        // Sort color entries by (file, displayName) so the on-disk file
+        // is deterministic — easier diffs and human inspection.
+        var colorEntries: [ColorEntry] = []
+        for (ref, rgb) in customColors {
+            guard let signal = resolve(ref),
+                  let loaded = documents.first(where: { $0.id == ref.document }) else {
+                continue
+            }
+            colorEntries.append(ColorEntry(
+                filePath: canonicalPath(for: loaded.sourceURL),
+                displayName: signal.displayName,
+                red: rgb.red,
+                green: rgb.green,
+                blue: rgb.blue,
+                alpha: rgb.alpha
+            ))
+        }
+        colorEntries.sort { lhs, rhs in
+            if lhs.filePath != rhs.filePath { return lhs.filePath < rhs.filePath }
+            return lhs.displayName < rhs.displayName
+        }
+        snapshot.customColors = colorEntries
+
+        return snapshot
+    }
+
+    /// Read `~/.waveform-viewer.json` and apply it: load every listed
+    /// file from disk, then re-check the listed signals and reapply the
+    /// color overrides. Any current state is replaced (this is "restore",
+    /// not "merge"). Files that no longer exist or fail to parse, and
+    /// signals/colors whose name no longer resolves inside their file,
+    /// are silently skipped — their absence is reported in `loadError`
+    /// so the user can see what was lost.
+    public func restoreSession() {
+        let snapshot: SessionSnapshot
+        do {
+            snapshot = try SessionStore.load()
+        } catch {
+            loadError = "Failed to restore session: \(error.localizedDescription)"
+            return
+        }
+
+        applySnapshot(snapshot)
+    }
+
+    /// Test seam exposing the apply step without touching the filesystem.
+    internal func applySnapshot(_ snapshot: SessionSnapshot) {
+        isRestoring = true
+        defer {
+            isRestoring = false
+            saveSession()
+        }
+
+        // Wipe everything before applying — restore is not a merge.
+        documents = []
+        fileNodes = []
+        checkedSignals = []
+        gateOff = []
+        customColors = [:]
+        focusedSignalRef = nil
+        localViewportsX = [:]
+        viewportsY = [:]
+        sharedState.viewportX = nil
+        cursorTimeX = nil
+        loadError = nil
+
+        var problems: [String] = []
+
+        for path in snapshot.openFiles {
+            let url = URL(fileURLWithPath: path)
+            do {
+                let doc = try WaveformDocument.load(from: url)
+                let id = DocumentID()
+                let loaded = LoadedDocument(id: id, document: doc)
+                documents.append(loaded)
+                let fileNode = HierarchyNode.fileContainer(
+                    wrapping: doc.hierarchyRoot,
+                    documentID: id,
+                    name: fileNodeName(for: loaded)
+                )
+                fileNodes.append(fileNode)
+            } catch {
+                problems.append("Could not reopen \(url.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+
+        if !documents.isEmpty {
+            seedViewportsFromOverallRange()
+        }
+
+        for entry in snapshot.selectedSignals {
+            guard let (loaded, signal) = findSignal(
+                path: entry.filePath,
+                displayName: entry.displayName
+            ) else {
+                problems.append("Could not re-check signal \(entry.displayName) in \(URL(fileURLWithPath: entry.filePath).lastPathComponent)")
+                continue
+            }
+            let ref = SignalRef(document: loaded.id, local: signal.id)
+            if !checkedSignals.contains(ref) {
+                checkedSignals.append(ref)
+            }
+        }
+
+        for entry in snapshot.customColors {
+            guard let (loaded, signal) = findSignal(
+                path: entry.filePath,
+                displayName: entry.displayName
+            ) else {
+                continue
+            }
+            let ref = SignalRef(document: loaded.id, local: signal.id)
+            customColors[ref] = RGBColor(
+                red: entry.red,
+                green: entry.green,
+                blue: entry.blue,
+                alpha: entry.alpha
+            )
+        }
+
+        if !problems.isEmpty {
+            loadError = problems.joined(separator: "\n")
+        }
+    }
+
+    private func findSignal(
+        path: String,
+        displayName: String
+    ) -> (LoadedDocument, Signal)? {
+        let target = canonicalPath(for: URL(fileURLWithPath: path))
+        guard let loaded = documents.first(where: { canonicalPath(for: $0.sourceURL) == target }) else {
+            return nil
+        }
+        guard let signal = loaded.signals.first(where: { $0.displayName == displayName }) else {
+            return nil
+        }
+        return (loaded, signal)
     }
 }

@@ -51,8 +51,7 @@ private struct DetailPane: View {
     /// canonical order means panels don't jump around when users flip
     /// checkboxes on and off.
     private var visibleUnits: [SignalKind] {
-        let present = Set(state.visibleUnits())
-        return SignalKind.routable.filter { present.contains($0) }
+        SignalKind.routable.filter { !state.effectiveVisibleSignals(unit: $0).isEmpty }
     }
 
     @ViewBuilder private var emptyState: some View {
@@ -113,19 +112,37 @@ private struct DetailPane: View {
     }
 
     @ViewBuilder private var stackedPanels: some View {
+        // Hardcoded canonical order — voltage → current → power → logic —
+        // with explicit per-unit conditionals so SwiftUI cannot possibly
+        // reorder panels through ForEach identity tricks. Panels that have
+        // no effective-visible signals simply aren't emitted.
         VStack(spacing: 0) {
-            ForEach(Array(visibleUnits.enumerated()), id: \.element) { index, unit in
-                if index > 0 {
-                    Divider()
-                }
-                UnitPlotPanel(state: state, unit: unit)
-            }
+            unitSection(.voltage, isFirst: isFirstVisible(.voltage))
+            unitSection(.current, isFirst: isFirstVisible(.current))
+            unitSection(.power,   isFirst: isFirstVisible(.power))
+            unitSection(.logicVoltage, isFirst: isFirstVisible(.logicVoltage))
             Divider()
             PlotStatusBar(
                 cursorTime: state.cursorTimeX,
                 viewport: state.xViewport(for: visibleUnits.first ?? .voltage),
                 fullSpan: state.overallTimeRange
             )
+        }
+    }
+
+    /// True when `unit` is the first visible unit in canonical order. Used
+    /// to suppress the leading divider for the topmost panel.
+    private func isFirstVisible(_ unit: SignalKind) -> Bool {
+        visibleUnits.first == unit
+    }
+
+    @ViewBuilder
+    private func unitSection(_ unit: SignalKind, isFirst: Bool) -> some View {
+        if !state.effectiveVisibleSignals(unit: unit).isEmpty {
+            if !isFirst {
+                Divider()
+            }
+            UnitPlotPanel(state: state, unit: unit)
         }
     }
 }

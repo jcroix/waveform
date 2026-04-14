@@ -32,8 +32,16 @@ public struct DecimatedTrace: Sendable, Equatable {
 public enum Decimator {
     /// Bucket `values` into `pixelWidth` pixel columns across `viewport`, keeping only
     /// the per-column min and max. Assumes `timeValues` is non-empty, monotonically
-    /// non-decreasing, and aligned 1:1 with `values`. Samples outside the viewport are
-    /// skipped.
+    /// non-decreasing, and aligned 1:1 with `values`.
+    ///
+    /// Samples outside the viewport aren't bucketed directly, but the polyline IS
+    /// clipped against the viewport edges so the leftmost and rightmost visible
+    /// segments render correctly. Specifically, if the sample immediately before
+    /// the viewport exists, we linearly interpolate the line between it and the
+    /// first in-viewport sample at `t == viewport.lowerBound` and bucket that
+    /// interpolated value at column 0. Same treatment for the right edge. Without
+    /// this, zoomed-in views would be missing their leftmost / rightmost line
+    /// segments because the out-of-viewport endpoints got dropped.
     ///
     /// When `fillInterpolatedGaps` is true (the default — what the plot panel uses),
     /// empty buckets that sit between two populated ones are filled in with linearly-
@@ -72,13 +80,35 @@ public enum Decimator {
         // the full trace length.
         let startIndex = lowerBound(timeValues, target: tMin)
         let endIndex = upperBoundInclusive(timeValues, target: tMax)
-        guard startIndex < endIndex else {
-            return DecimatedTrace(pixelWidth: pixelWidth, buckets: buckets)
-        }
 
         let widthDouble = Double(pixelWidth)
         let lastColumnIndex = pixelWidth - 1
 
+        // Left-edge clip: if a sample exists just before the viewport and at least
+        // one sample exists inside or after it, linearly interpolate the polyline
+        // value at `tMin` and plant it in column 0. This ensures the first visible
+        // segment draws from the true polyline value at the left edge rather than
+        // starting at whichever in-viewport sample happens to exist first.
+        if startIndex > 0 && startIndex < timeValues.count {
+            let tPrev = timeValues[startIndex - 1]
+            let vPrev = values[startIndex - 1]
+            let tNext = timeValues[startIndex]
+            let vNext = values[startIndex]
+            let interp: Float
+            if tNext == tPrev {
+                interp = vPrev
+            } else {
+                let frac = (tMin - tPrev) / (tNext - tPrev)
+                interp = vPrev + Float(frac) * (vNext - vPrev)
+            }
+            buckets[0] = DecimationBucket(
+                minValue: interp,
+                maxValue: interp,
+                isPopulated: true
+            )
+        }
+
+        // In-viewport samples.
         for i in startIndex..<endIndex {
             let t = timeValues[i]
             let v = values[i]
@@ -101,6 +131,40 @@ public enum Decimator {
                 buckets[col] = DecimationBucket(
                     minValue: v,
                     maxValue: v,
+                    isPopulated: true
+                )
+            }
+        }
+
+        // Right-edge clip: mirror of the left clip. If a sample exists just after
+        // the viewport and at least one exists at or before it, interpolate at
+        // `tMax` and plant the value in the last column.
+        if endIndex < timeValues.count && endIndex > 0 {
+            let tPrev = timeValues[endIndex - 1]
+            let vPrev = values[endIndex - 1]
+            let tNext = timeValues[endIndex]
+            let vNext = values[endIndex]
+            let interp: Float
+            if tNext == tPrev {
+                interp = vPrev
+            } else {
+                let frac = (tMax - tPrev) / (tNext - tPrev)
+                interp = vPrev + Float(frac) * (vNext - vPrev)
+            }
+            let col = lastColumnIndex
+            let existing = buckets[col]
+            if existing.isPopulated {
+                let newMin = min(existing.minValue, interp)
+                let newMax = max(existing.maxValue, interp)
+                buckets[col] = DecimationBucket(
+                    minValue: newMin,
+                    maxValue: newMax,
+                    isPopulated: true
+                )
+            } else {
+                buckets[col] = DecimationBucket(
+                    minValue: interp,
+                    maxValue: interp,
                     isPopulated: true
                 )
             }

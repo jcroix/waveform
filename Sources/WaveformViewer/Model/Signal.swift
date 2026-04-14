@@ -49,6 +49,24 @@ public struct HierarchyKey: Hashable, Sendable {
     }
 }
 
+/// Storage-friendly RGBA color used for per-signal overrides. `NSColor` is
+/// dynamic (light/dark aware) and not `Sendable`, so we persist the user's
+/// explicit pick as raw sRGB components and rehydrate at render time. The
+/// components are always in [0, 1].
+public struct RGBColor: Hashable, Sendable {
+    public var red: Double
+    public var green: Double
+    public var blue: Double
+    public var alpha: Double
+
+    public init(red: Double, green: Double, blue: Double, alpha: Double = 1) {
+        self.red = red
+        self.green = green
+        self.blue = blue
+        self.alpha = alpha
+    }
+}
+
 /// A freshly-loaded `WaveformDocument` wrapped with its app-assigned
 /// `DocumentID`. `WaveformAppState` stores `[LoadedDocument]` rather than
 /// `[WaveformDocument]` so the parser layer stays unaware of multi-file

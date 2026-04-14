@@ -174,6 +174,55 @@ private func uniformlySampled(count: Int, generator: (Int) -> Float) -> (times: 
     }
 }
 
+@Test func leftEdgeInterpolatesSampleJustOutsideViewport() {
+    // Samples on a straight-line ramp v(t) = t, placed on a regular grid.
+    // Viewport starts BETWEEN two samples so the leftmost rendered segment
+    // depends on the clipping behavior.
+    //
+    // Before the fix this bucket came out empty because the pre-viewport
+    // sample was dropped by the binary search. After the fix, column 0
+    // should carry the linearly-interpolated value at t == viewport.lower.
+    let times: [Double] = [0, 1, 2, 3, 4, 5]
+    let values: [Float] = [0, 1, 2, 3, 4, 5]
+    let decimated = Decimator.decimate(
+        timeValues: times,
+        values: values,
+        viewport: 1.5...4.5,
+        pixelWidth: 10,
+        fillInterpolatedGaps: false
+    )
+
+    #expect(decimated.buckets[0].isPopulated)
+    #expect(abs(decimated.buckets[0].minValue - 1.5) < 1e-4)
+    #expect(abs(decimated.buckets[0].maxValue - 1.5) < 1e-4)
+    // Symmetric case on the right edge.
+    let lastCol = decimated.pixelWidth - 1
+    #expect(decimated.buckets[lastCol].isPopulated)
+    #expect(abs(decimated.buckets[lastCol].minValue - 4.5) < 1e-4)
+    #expect(abs(decimated.buckets[lastCol].maxValue - 4.5) < 1e-4)
+}
+
+@Test func viewportBetweenSamplesStillDrawsLine() {
+    // Viewport strictly between two samples — no in-viewport samples at
+    // all. The fix should still clip the polyline to both edges so we
+    // draw a straight line across the full plot.
+    let times: [Double] = [0, 10]
+    let values: [Float] = [0, 10]
+    let decimated = Decimator.decimate(
+        timeValues: times,
+        values: values,
+        viewport: 3...7,
+        pixelWidth: 5,
+        fillInterpolatedGaps: false
+    )
+
+    #expect(decimated.buckets[0].isPopulated)
+    #expect(abs(decimated.buckets[0].minValue - 3.0) < 1e-4)
+    let lastCol = decimated.pixelWidth - 1
+    #expect(decimated.buckets[lastCol].isPopulated)
+    #expect(abs(decimated.buckets[lastCol].minValue - 7.0) < 1e-4)
+}
+
 @Test func degenerateViewportReturnsEmptyBuckets() {
     let (t, v) = uniformlySampled(count: 5) { i in Float(i) }
     // lowerBound == upperBound → tSpan == 0 → all buckets empty.

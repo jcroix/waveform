@@ -96,6 +96,14 @@ final class PlotNSView: NSView {
 
     private var showGrid: Bool = true
 
+    /// Resolves a `SignalRef` to its effective color (custom override or
+    /// palette default). Injected via `setContent` so `PlotNSView` stays
+    /// model-agnostic — the owning SwiftUI view wires it to
+    /// `WaveformAppState.color(for:)`.
+    private var colorFor: (SignalRef) -> NSColor = { ref in
+        ColorPalette.stableColor(for: ref)
+    }
+
     // MARK: - Decimation cache
 
     private let decimationCache = DecimationCache(maxEntries: 32)
@@ -115,8 +123,10 @@ final class PlotNSView: NSView {
         let showGrid: Bool
         let yLowerBits: UInt64
         let yUpperBits: UInt64
+        let colorSignature: [ColorSignatureEntry]
     }
     private var lastRebuildKey: RebuildKey?
+    private var colorSignature: [ColorSignatureEntry] = []
 
     // MARK: - Margins
 
@@ -554,7 +564,9 @@ final class PlotNSView: NSView {
         yOverride: ClosedRange<Double>?,
         focusedSignalRef: SignalRef?,
         cursorTimeX: Double?,
-        showGrid: Bool
+        showGrid: Bool,
+        colorSignature: [ColorSignatureEntry],
+        colorFor: @escaping (SignalRef) -> NSColor
     ) {
         let docsChanged = (self.documentOrder != documentOrder)
         self.documents = documents
@@ -566,6 +578,8 @@ final class PlotNSView: NSView {
         self.focusedSignalRef = focusedSignalRef
         self.cursorTimeX = cursorTimeX
         self.showGrid = showGrid
+        self.colorSignature = colorSignature
+        self.colorFor = colorFor
         if docsChanged {
             decimationCache.removeAll()
         }
@@ -606,7 +620,8 @@ final class PlotNSView: NSView {
             cursorBits: cursorTimeX?.bitPattern,
             showGrid: showGrid,
             yLowerBits: yRange?.lowerBound.bitPattern ?? 0,
-            yUpperBits: yRange?.upperBound.bitPattern ?? 0
+            yUpperBits: yRange?.upperBound.bitPattern ?? 0,
+            colorSignature: colorSignature
         )
         if key == lastRebuildKey {
             return
@@ -953,7 +968,7 @@ final class PlotNSView: NSView {
             let isFocused = (entry.ref == focusedSignalRef)
             shape.frame = traceContainer.bounds
             shape.path = path
-            shape.strokeColor = ColorPalette.stableColor(for: entry.ref).cgColor
+            shape.strokeColor = colorFor(entry.ref).cgColor
             shape.lineWidth = isFocused ? 3.5 : 1.2
             shape.rasterizationScale = rasterScale
         }

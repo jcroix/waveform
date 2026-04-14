@@ -50,6 +50,12 @@ private struct FileCommands: View {
             state.presentOpenPanel()
         }
         .keyboardShortcut("o", modifiers: .command)
+
+        Button("Restore Last Session") {
+            state.restoreSession()
+        }
+        .keyboardShortcut("r", modifiers: [.command, .shift])
+        .disabled(!SessionStore.sessionFileExists)
     }
 }
 
@@ -95,6 +101,19 @@ private struct ViewCommands: View {
         .disabled(state.focusedSignalRef == nil)
 
         Divider()
+
+        Menu("Pan") {
+            Button("Left")  { state.panX(by: -0.1) }
+                .keyboardShortcut(.leftArrow,  modifiers: .option)
+            Button("Right") { state.panX(by:  0.1) }
+                .keyboardShortcut(.rightArrow, modifiers: .option)
+            Divider()
+            Button("Up")    { state.panY(by:  0.1) }
+                .keyboardShortcut(.upArrow,    modifiers: .option)
+            Button("Down")  { state.panY(by: -0.1) }
+                .keyboardShortcut(.downArrow,  modifiers: .option)
+        }
+        .disabled(state.documents.isEmpty)
 
         Menu("Horizontal Zoom") {
             Button("Zoom In") { state.zoomX(by: 2) }

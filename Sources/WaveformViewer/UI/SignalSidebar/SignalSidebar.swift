@@ -52,11 +52,13 @@ struct SignalSidebar: View {
             SignalOutlineView(
                 fileNodes: state.fileNodes,
                 filterText: state.filterText,
-                // Reading the two collections here subscribes the sidebar to
-                // them through the Observation framework so changes in either
-                // drive updateNSView, which refreshes cell content.
+                // Reading these collections here subscribes the sidebar to
+                // them through the Observation framework so changes drive
+                // updateNSView, which refreshes cell content and focus sync.
                 checkedSignals: state.checkedSignals,
                 gateOff: state.gateOff,
+                customColors: state.customColors,
+                focusedSignalRef: state.focusedSignalRef,
                 cursorTimeX: state.cursorTimeX,
                 state: state
             )

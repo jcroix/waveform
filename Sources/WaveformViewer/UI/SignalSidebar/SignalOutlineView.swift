@@ -16,19 +16,37 @@ import SwiftUI
 /// When the user ticks a child under an already-closed gate, every ancestor
 /// gate along the path auto-re-opens so the new trace actually draws.
 ///
-/// File rows have a right-click context menu with a single "Close File"
-/// action that calls `appState.closeDocument(_:)`.
+/// File rows additionally carry:
+/// - a visible × button on the trailing edge that calls
+///   `appState.closeDocument(_:)` (the right-click "Close File" context menu
+///   works too, but people miss context menus).
 ///
-/// `checkedSignals`, `gateOff`, and `cursorTimeX` are threaded through as
-/// direct struct properties so the outer `SignalSidebar` body reads them at
-/// construction time and gets subscribed to them through the Observation
-/// framework. Without those reads, menu commands and plot-driven cursor moves
-/// would mutate state but never trigger `updateNSView` here.
+/// Leaf rows additionally carry:
+/// - an `NSColorWell` to the right of the signal-kind icon so users can
+///   override the palette-derived default color per signal. Clicking the
+///   well opens the shared color panel; on selection change the new color
+///   flows into `WaveformAppState.customColors` and the plot rebuilds.
+///
+/// Focus sync: the outline's native selection is driven by
+/// `WaveformAppState.focusedSignalRef`. Clicking a leaf row sets focus;
+/// clicking a trace in the plot pops the corresponding sidebar row into the
+/// selection. A re-entrancy guard (`isApplyingStateFocus`) prevents the
+/// selection change delegate from fighting the state update during
+/// programmatic selects.
+///
+/// `checkedSignals`, `gateOff`, `customColors`, `focusedSignalRef`, and
+/// `cursorTimeX` are threaded through as direct struct properties so the
+/// outer `SignalSidebar` body reads them at construction time and gets
+/// subscribed to them through the Observation framework. Without those
+/// reads, menu commands and plot-driven cursor moves would mutate state
+/// but never trigger `updateNSView` here.
 struct SignalOutlineView: NSViewRepresentable {
     let fileNodes: [HierarchyNode]
     let filterText: String
     let checkedSignals: [SignalRef]
     let gateOff: Set<HierarchyKey>
+    let customColors: [SignalRef: RGBColor]
+    let focusedSignalRef: SignalRef?
     let cursorTimeX: Double?
     @Bindable var state: WaveformAppState
 
@@ -71,6 +89,7 @@ struct SignalOutlineView: NSViewRepresentable {
         coordinator.outlineView = outline
         coordinator.rebuild(fileNodes: fileNodes, filter: filterText)
         outline.reloadData()
+        coordinator.applyFocusedRow(focusedSignalRef: focusedSignalRef)
 
         return scroll
     }
@@ -90,6 +109,7 @@ struct SignalOutlineView: NSViewRepresentable {
                 }
             }
         }
+        context.coordinator.applyFocusedRow(focusedSignalRef: focusedSignalRef)
     }
 
     @MainActor
@@ -103,6 +123,12 @@ struct SignalOutlineView: NSViewRepresentable {
         private var displayedFileNodes: [HierarchyNode] = []
         private var lastFileIdentities: [ObjectIdentifier] = []
         private var lastFilter: String = ""
+
+        /// Re-entrancy guard for the focus sync. Set to `true` around our
+        /// own calls to `selectRowIndexes` so the `selectionDidChange`
+        /// delegate callback doesn't echo the value right back into
+        /// `state.focusedSignalRef`.
+        private var isApplyingStateFocus = false
 
         init(parent: SignalOutlineView) {
             self.parent = parent
@@ -126,6 +152,101 @@ struct SignalOutlineView: NSViewRepresentable {
                     HierarchyNode.filter(node, matching: filter)
                 }
             }
+        }
+
+        /// Sync the outline's selected row to match the currently focused
+        /// signal ref. Called after every `reloadData` and every
+        /// `updateNSView` so the row stays highlighted through filter
+        /// rebuilds. Clears the selection when `focusedSignalRef` is nil.
+        func applyFocusedRow(focusedSignalRef: SignalRef?) {
+            guard let outline = outlineView else { return }
+            guard let ref = focusedSignalRef else {
+                if outline.selectedRow >= 0 {
+                    isApplyingStateFocus = true
+                    outline.deselectAll(nil)
+                    isApplyingStateFocus = false
+                }
+                return
+            }
+            guard let node = findLeafNode(for: ref) else {
+                // Focused ref isn't visible in the current filtered forest —
+                // nothing to highlight.
+                if outline.selectedRow >= 0 {
+                    isApplyingStateFocus = true
+                    outline.deselectAll(nil)
+                    isApplyingStateFocus = false
+                }
+                return
+            }
+            // Expand every ancestor so the row is actually in the outline
+            // before we try to select it.
+            expandAncestors(of: node)
+            let row = outline.row(forItem: node)
+            guard row >= 0 else { return }
+            if outline.selectedRow == row { return }
+            isApplyingStateFocus = true
+            outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            outline.scrollRowToVisible(row)
+            isApplyingStateFocus = false
+        }
+
+        /// Walk the filtered forest looking for a leaf node whose signal
+        /// matches `ref`. Returns the matching `HierarchyNode` or nil when
+        /// the ref isn't visible in the current filter.
+        private func findLeafNode(for ref: SignalRef) -> HierarchyNode? {
+            for fileNode in displayedFileNodes {
+                guard case .file(let documentID) = fileNode.kind,
+                      documentID == ref.document else { continue }
+                if let found = findLeafNode(for: ref, in: fileNode) {
+                    return found
+                }
+            }
+            return nil
+        }
+
+        private func findLeafNode(for ref: SignalRef, in node: HierarchyNode) -> HierarchyNode? {
+            if node.signalID == ref.local {
+                return node
+            }
+            for child in node.children {
+                if let found = findLeafNode(for: ref, in: child) {
+                    return found
+                }
+            }
+            return nil
+        }
+
+        /// Expand every ancestor of `node` so that NSOutlineView can return
+        /// a row index for it. Walks from the top-level file nodes downward
+        /// since NSOutlineView requires parents to be expanded for
+        /// `row(forItem:)` to return a valid index.
+        private func expandAncestors(of node: HierarchyNode) {
+            guard let outline = outlineView else { return }
+            let path = pathFromRoot(to: node)
+            for ancestor in path.dropLast() {
+                if outline.isExpandable(ancestor), !outline.isItemExpanded(ancestor) {
+                    outline.expandItem(ancestor)
+                }
+            }
+        }
+
+        private func pathFromRoot(to target: HierarchyNode) -> [HierarchyNode] {
+            for fileNode in displayedFileNodes {
+                if let trail = pathFromRoot(to: target, in: fileNode) {
+                    return trail
+                }
+            }
+            return []
+        }
+
+        private func pathFromRoot(to target: HierarchyNode, in node: HierarchyNode) -> [HierarchyNode]? {
+            if node === target { return [node] }
+            for child in node.children {
+                if let tail = pathFromRoot(to: target, in: child) {
+                    return [node] + tail
+                }
+            }
+            return nil
         }
 
         // MARK: NSOutlineViewDataSource
@@ -158,18 +279,8 @@ struct SignalOutlineView: NSViewRepresentable {
         ) -> NSView? {
             guard let node = item as? HierarchyNode else { return nil }
 
-            // Resolve the document this node belongs to so we can build refs
-            // and gate keys without re-walking the forest every refresh.
             let owningDocument: DocumentID? = owningDocumentID(for: node)
-            let signal: Signal? = {
-                guard case .leaf = node.kind,
-                      let local = node.signalID,
-                      let doc = owningDocument,
-                      let loaded = parent.state.documents.first(where: { $0.id == doc }) else {
-                    return nil
-                }
-                return loaded.signal(withLocalID: local)
-            }()
+            let signal: Signal? = resolveSignal(for: node, owningDocument: owningDocument)
 
             let cell = SignalCellView(
                 node: node,
@@ -178,6 +289,50 @@ struct SignalOutlineView: NSViewRepresentable {
                 state: parent.state
             )
             return cell
+        }
+
+        /// Every row in the forest is selectable. The delegate callback
+        /// `outlineViewSelectionDidChange` handles routing the new
+        /// selection to `state.focusedSignalRef`.
+        func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {
+            return true
+        }
+
+        func outlineViewSelectionDidChange(_ notification: Notification) {
+            guard !isApplyingStateFocus, let outline = outlineView else { return }
+            let row = outline.selectedRow
+            guard row >= 0,
+                  let node = outline.item(atRow: row) as? HierarchyNode else {
+                // Clearing the selection in the sidebar also clears focus
+                // in the state so the plot unhighlights its trace.
+                if row < 0 {
+                    parent.state.focusedSignalRef = nil
+                }
+                return
+            }
+            guard let owningDocument = owningDocumentID(for: node),
+                  let localID = node.signalID else {
+                // File-kind or interior-without-signal row: don't touch
+                // focus. (Users can still select these rows to read the
+                // highlight.)
+                return
+            }
+            let ref = SignalRef(document: owningDocument, local: localID)
+            if parent.state.focusedSignalRef != ref {
+                parent.state.focusedSignalRef = ref
+            }
+        }
+
+        private func resolveSignal(
+            for node: HierarchyNode,
+            owningDocument: DocumentID?
+        ) -> Signal? {
+            guard let localID = node.signalID,
+                  let doc = owningDocument,
+                  let loaded = parent.state.documents.first(where: { $0.id == doc }) else {
+                return nil
+            }
+            return loaded.signal(withLocalID: localID)
         }
 
         /// Find the `DocumentID` of the file that contains `node`. For a file
@@ -204,10 +359,6 @@ struct SignalOutlineView: NSViewRepresentable {
 
         // MARK: File context menu
 
-        /// Build a one-item NSMenu bound to our coordinator. NSOutlineView
-        /// raises -menu(for:) on right-click; we use the dynamic
-        /// outlineView:menu: delegate method approach via the plain `menu`
-        /// property plus per-row validation inside the action.
         func makeFileContextMenu() -> NSMenu {
             let menu = NSMenu()
             let close = NSMenuItem(
@@ -254,25 +405,27 @@ extension SignalOutlineView.Coordinator: NSMenuDelegate {
 
 // MARK: - Custom cell view
 
-/// Row view for the signal outline. Layout:
+/// Row view for the signal outline. Layout differs by node kind:
 ///
-///     [checkbox] [icon] [name]                 [value]
+///     file:     [checkbox] [tray-icon] [name]                         [×]
+///     interior: [checkbox] [folder]    [name]                 [value]
+///     leaf:     [checkbox] [kind-icon] [colorWell] [name]     [value]
 ///
-/// Leaf rows drive `WaveformAppState.checkedSignals`; file and interior rows
-/// drive `WaveformAppState.gateOff`. `value` is populated only when a cursor
-/// is placed in the plot and this row corresponds to a real signal. The file
-/// row icon is a tray, interior rows get a folder, leaves get the
-/// signal-kind-specific glyph.
+/// Leaf rows drive `WaveformAppState.checkedSignals`; file and interior
+/// rows drive `WaveformAppState.gateOff`. The color well in leaf rows
+/// forwards its picked color to `WaveformAppState.customColors`.
 final class SignalCellView: NSTableCellView {
     private let node: HierarchyNode
     private let owningDocument: DocumentID?
     private let signal: Signal?
-    private let state: WaveformAppState
+    private weak var state: WaveformAppState?
 
     private let checkbox = NSButton()
     private let iconView = NSImageView()
+    private let colorWell = NSColorWell(style: .minimal)
     private let nameField = NSTextField(labelWithString: "")
     private let valueField = NSTextField(labelWithString: "")
+    private let closeButton = NSButton()
 
     init(
         node: HierarchyNode,
@@ -305,6 +458,12 @@ final class SignalCellView: NSTableCellView {
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.imageScaling = .scaleProportionallyDown
 
+        colorWell.translatesAutoresizingMaskIntoConstraints = false
+        colorWell.isBordered = false
+        colorWell.target = self
+        colorWell.action = #selector(handleColorWell(_:))
+        colorWell.toolTip = "Click to change this signal's trace color"
+
         nameField.translatesAutoresizingMaskIntoConstraints = false
         nameField.font = .systemFont(ofSize: NSFont.systemFontSize)
         nameField.lineBreakMode = .byTruncatingMiddle
@@ -321,27 +480,56 @@ final class SignalCellView: NSTableCellView {
         valueField.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
         valueField.setContentHuggingPriority(.defaultHigh, for: .horizontal)
 
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        closeButton.image = NSImage(
+            systemSymbolName: "xmark.circle.fill",
+            accessibilityDescription: "Close file"
+        )
+        closeButton.isBordered = false
+        closeButton.imagePosition = .imageOnly
+        closeButton.contentTintColor = .secondaryLabelColor
+        closeButton.target = self
+        closeButton.action = #selector(handleCloseFile(_:))
+        closeButton.toolTip = "Close this file"
+
         addSubview(checkbox)
         addSubview(iconView)
+        addSubview(colorWell)
         addSubview(nameField)
         addSubview(valueField)
+        addSubview(closeButton)
 
+        // The icon and the color well share the same "leading widget" slot.
+        // Each row only shows one or the other (file/interior-folder rows
+        // get the icon; leaf rows get the color well). Sharing the slot
+        // keeps every row's name column aligned at the same x regardless
+        // of kind, which is what NSOutlineView's source-list style wants.
         NSLayoutConstraint.activate([
             checkbox.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
             checkbox.centerYAnchor.constraint(equalTo: centerYAnchor),
             checkbox.widthAnchor.constraint(equalToConstant: 16),
 
-            iconView.leadingAnchor.constraint(equalTo: checkbox.trailingAnchor, constant: 4),
+            iconView.leadingAnchor.constraint(equalTo: checkbox.trailingAnchor, constant: 6),
             iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
             iconView.widthAnchor.constraint(equalToConstant: 16),
             iconView.heightAnchor.constraint(equalToConstant: 16),
 
-            nameField.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 6),
+            colorWell.leadingAnchor.constraint(equalTo: checkbox.trailingAnchor, constant: 6),
+            colorWell.centerYAnchor.constraint(equalTo: centerYAnchor),
+            colorWell.widthAnchor.constraint(equalToConstant: 16),
+            colorWell.heightAnchor.constraint(equalToConstant: 14),
+
+            nameField.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 10),
             nameField.centerYAnchor.constraint(equalTo: centerYAnchor),
             nameField.trailingAnchor.constraint(lessThanOrEqualTo: valueField.leadingAnchor, constant: -8),
 
-            valueField.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            valueField.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -6),
             valueField.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            closeButton.widthAnchor.constraint(equalToConstant: 16),
+            closeButton.heightAnchor.constraint(equalToConstant: 16),
         ])
     }
 
@@ -350,55 +538,67 @@ final class SignalCellView: NSTableCellView {
 
         switch node.kind {
         case .file:
+            // File rows show a tray glyph in the leading slot, bold name,
+            // and a close button on the trailing edge. No color well —
+            // files aren't drawn in the plot.
             checkbox.isHidden = false
             nameField.font = .boldSystemFont(ofSize: NSFont.systemFontSize)
+            iconView.isHidden = false
             iconView.image = NSImage(
                 systemSymbolName: "tray.full",
                 accessibilityDescription: nil
             )
             iconView.contentTintColor = .secondaryLabelColor
+            colorWell.isHidden = true
             valueField.isHidden = true
+            closeButton.isHidden = false
         case .interior:
+            // Interior rows without a probe show a folder icon. Interior
+            // rows that DO probe their own signal act like leaves and
+            // show a color well instead.
             checkbox.isHidden = false
-            if let signal = signal {
-                iconView.image = NSImage(
-                    systemSymbolName: iconName(for: signal.kind),
-                    accessibilityDescription: nil
-                )
-                if let ref = leafRef() {
-                    iconView.contentTintColor = ColorPalette.stableColor(for: ref)
-                } else {
-                    iconView.contentTintColor = .secondaryLabelColor
-                }
+            nameField.font = .systemFont(ofSize: NSFont.systemFontSize)
+            closeButton.isHidden = true
+            if signal != nil {
+                iconView.isHidden = true
+                colorWell.isHidden = false
                 valueField.isHidden = false
             } else {
+                iconView.isHidden = false
                 iconView.image = NSImage(
                     systemSymbolName: "folder",
                     accessibilityDescription: nil
                 )
                 iconView.contentTintColor = .secondaryLabelColor
+                colorWell.isHidden = true
                 valueField.isHidden = true
             }
         case .leaf:
+            // Leaf rows: the color well IS the leading glyph. The kind
+            // (voltage / current / power) is implicit from the hosting
+            // plot panel's unit label, so we don't also clutter the row
+            // with a bolt/arrows/sun glyph next to the swatch.
             checkbox.isHidden = false
-            if let signal = signal {
-                iconView.image = NSImage(
-                    systemSymbolName: iconName(for: signal.kind),
-                    accessibilityDescription: nil
-                )
-                if let ref = leafRef() {
-                    iconView.contentTintColor = ColorPalette.stableColor(for: ref)
-                }
+            nameField.font = .systemFont(ofSize: NSFont.systemFontSize)
+            closeButton.isHidden = true
+            iconView.isHidden = true
+            if signal != nil {
+                colorWell.isHidden = false
                 valueField.isHidden = false
+            } else {
+                colorWell.isHidden = true
+                valueField.isHidden = true
             }
         }
 
         refreshDynamicContent()
     }
 
-    /// Refreshes the checkbox (gate or visibility) and the cursor-readout
-    /// value label. Called from `updateNSView` on observed-state changes.
+    /// Refreshes the checkbox (gate or visibility), the color well, and
+    /// the cursor-readout value label. Called from `updateNSView` on
+    /// observed-state changes.
     func refreshDynamicContent() {
+        guard let state = state else { return }
         switch node.kind {
         case .file, .interior:
             if let key = hierarchyKey() {
@@ -407,20 +607,21 @@ final class SignalCellView: NSTableCellView {
                 checkbox.state = .on
             }
             if case .interior = node.kind, signal != nil, let ref = leafRef() {
-                // Interior node that also probes a signal: show cursor value.
-                populateCursorValue(ref: ref, signal: signal!)
+                populateCursorValue(ref: ref, signal: signal!, state: state)
+                colorWell.color = state.color(for: ref)
             }
         case .leaf:
             if let ref = leafRef() {
                 checkbox.state = state.isChecked(ref) ? .on : .off
                 if let signal = signal {
-                    populateCursorValue(ref: ref, signal: signal)
+                    populateCursorValue(ref: ref, signal: signal, state: state)
                 }
+                colorWell.color = state.color(for: ref)
             }
         }
     }
 
-    private func populateCursorValue(ref: SignalRef, signal: Signal) {
+    private func populateCursorValue(ref: SignalRef, signal: Signal, state: WaveformAppState) {
         if let cursorTime = state.cursorTimeX,
            let loaded = state.documents.first(where: { $0.id == ref.document }),
            let value = signal.value(atTime: cursorTime, timeValues: loaded.timeValues) {
@@ -433,16 +634,13 @@ final class SignalCellView: NSTableCellView {
     }
 
     @objc private func handleCheckbox(_ sender: NSButton) {
+        guard let state = state else { return }
         let turningOn = (sender.state == .on)
         switch node.kind {
         case .file:
             guard let key = hierarchyKey() else { return }
             state.setGateOpen(key, open: turningOn)
         case .interior:
-            // Interior nodes that don't carry their own signal behave as
-            // subckt gates. Interior nodes that DO carry a signal (the
-            // v(x1) + v(x1.a) case) drive that signal's own visibility
-            // just like a leaf.
             if signal == nil {
                 guard let key = hierarchyKey() else { return }
                 state.setGateOpen(key, open: turningOn)
@@ -454,6 +652,16 @@ final class SignalCellView: NSTableCellView {
             guard let ref = leafRef() else { return }
             state.setSignalChecked(ref, checked: turningOn)
         }
+    }
+
+    @objc private func handleColorWell(_ sender: NSColorWell) {
+        guard let state = state, let ref = leafRef() else { return }
+        state.setCustomColor(sender.color, for: ref)
+    }
+
+    @objc private func handleCloseFile(_ sender: NSButton) {
+        guard let state = state, let id = node.documentID else { return }
+        state.closeDocument(id)
     }
 
     private func hierarchyKey() -> HierarchyKey? {

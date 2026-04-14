@@ -71,7 +71,7 @@ struct UnitPlotPanel: View {
                     let isFocused = (state.focusedSignalRef == ref)
                     HStack(spacing: 6) {
                         Circle()
-                            .fill(Color(nsColor: ColorPalette.stableColor(for: ref)))
+                            .fill(Color(nsColor: state.color(for: ref)))
                             .frame(width: isFocused ? 12 : 10, height: isFocused ? 12 : 10)
                         Text(legendName(for: ref, signal: signal))
                             .font(.caption)
@@ -93,6 +93,8 @@ struct UnitPlotPanel: View {
             focusedSignalRef: state.focusedSignalRef,
             cursorTimeX: state.cursorTimeX,
             showGrid: state.showGrid,
+            colorSignature: colorSignature,
+            colorFor: { ref in state.color(for: ref) },
             onViewportChange: { state.setXViewport($0, for: unit) },
             onYViewportChange: { range in
                 if let range = range {
@@ -107,6 +109,24 @@ struct UnitPlotPanel: View {
         )
         .id("unit-plot-\(unit.routingID)")
         .frame(minHeight: 140)
+    }
+
+    /// Build the RebuildKey color signature for the currently-visible refs.
+    /// One entry per ref regardless of whether a custom override exists —
+    /// so reverting a signal to its palette default still invalidates the
+    /// dedupe cache.
+    private var colorSignature: [ColorSignatureEntry] {
+        refs.map { ref in
+            let color = state.color(for: ref)
+            let srgb = color.usingColorSpace(.sRGB) ?? color
+            return ColorSignatureEntry(
+                ref: ref,
+                r: Double(srgb.redComponent),
+                g: Double(srgb.greenComponent),
+                b: Double(srgb.blueComponent),
+                a: Double(srgb.alphaComponent)
+            )
+        }
     }
 
     /// When more than one file is loaded, prefix each legend entry with its
